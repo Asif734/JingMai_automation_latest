@@ -1,14 +1,79 @@
 import ApplicationServices
 import Cocoa
 import CryptoKit
+#if JD_UI_WORKER
+typealias FlutterResult = (Any?) -> Void
+#else
 import FlutterMacOS
+#endif
 import Speech
 import Vision
 import AVFoundation
 
-/// MethodChannel boundary for guarded macOS capture and delivery.
+struct NativeAutomationRequest {
+  let method: String
+  let arguments: Any?
+}
+
+#if !JD_UI_WORKER
+/// UI mutations never execute in the Flutter process. A lost callback can be
+/// recovered by terminating only our own helper, not JD or the operator's app.
 final class AccessibilityBridge {
   private let channel: FlutterMethodChannel
+  private let endpoint = NativeAutomationEndpoint()
+  private let worker = NativeUiWorkerClient()
+  init(messenger: FlutterBinaryMessenger) {
+    channel = FlutterMethodChannel(name: "com.grozziie.jdAutomation/accessibility", binaryMessenger: messenger)
+    endpoint.onEvent = { [weak self] method, payload in
+      DispatchQueue.main.async { self?.channel.invokeMethod(method, arguments: payload) }
+    }
+    worker.onEvent = endpoint.onEvent
+    channel.setMethodCallHandler { [weak self] call, result in
+      guard let self else { return }
+      let args = call.arguments as? [String: Any] ?? [:]
+      switch call.method {
+      case "status":
+        self.endpoint.handle(NativeAutomationRequest(method: "status", arguments: nil)) { value in
+          self.worker.inspectStatus { workerValue in
+            var status = value as? [String: Any] ?? [:]
+            let helper = workerValue as? [String: Any] ?? [:]
+            status["uiWorkerAvailable"] = helper["available"] as? Bool ?? false
+            status["uiWorkerTrusted"] = helper["trusted"] as? Bool ?? false
+            status["uiWorkerScreenRecording"] = helper["screenRecording"] as? Bool ?? false
+            status["uiWorkerError"] = helper["error"]
+            if let helperPID = helper["appProcessId"] as? Int {
+              status["competingApps"] = (status["competingApps"] as? [[String: Any]] ?? []).filter { $0["pid"] as? Int != helperPID }
+            }
+            result(status)
+          }
+        }
+      case "beginUiOperation": self.worker.begin(args, completion: result)
+      case "endUiOperation": self.worker.end(args, completion: result)
+      case "cancelUiOperation": self.worker.cancel(args, completion: result)
+      default:
+        if NativeAutomationEndpoint.workerMethods.contains(call.method) {
+          self.worker.invoke(call.method, arguments: args, completion: result)
+        } else {
+          self.endpoint.handle(NativeAutomationRequest(method: call.method, arguments: call.arguments), result: result)
+        }
+      }
+    }
+  }
+}
+#endif
+
+/// Same capture/cache/identity implementation in both the app and its helper.
+/// The helper dispatch changes isolation, not media selection or send checks.
+final class NativeAutomationEndpoint {
+  static let workerMethods: Set<String> = [
+    "ensureReceptionWindow", "openConversation", "captureImageRegion",
+    "classifyMessageAt", "downloadImageAt", "downloadVideoAt",
+    "beginAttachmentDownload", "captureRecentCachedVideo", "workerStatus",
+    "probeRecentCachedMedia", "sendDraftOnce", "retryFailedOutgoingMessage",
+    "listActiveTransferAccounts", "transferConversation", "cancelTransferSelection",
+    "scrollConversation"
+  ]
+  var onEvent: ((String, [String: Any]) -> Void)?
   private let collector = QianniuAXCollector()
   private let ocrInspector = QianniuOCRInspector()
   private let audioTranscriber = VideoAudioTranscriber()
@@ -17,25 +82,22 @@ final class AccessibilityBridge {
   private var unreadSignalInFlight = false
   private var unreadSignalWaiters: [FlutterResult] = []
 
-  init(messenger: FlutterBinaryMessenger) {
+  init() {
     // Setting an application root affects only that object. The system-wide
     // object sets the default for every AX element in this process, including
     // children created during traversal. Never use the OS's long default wait.
     _ = AXUIElementSetMessagingTimeout(AXUIElementCreateSystemWide(), 0.75)
-    channel = FlutterMethodChannel(
-      name: "com.grozziie.jdAutomation/accessibility",
-      binaryMessenger: messenger)
-    channel.setMethodCallHandler { [weak self] call, result in
-      self?.handle(call, result: result)
-    }
     collector.onCapture = { [weak self] capture in
-      DispatchQueue.main.async { self?.channel.invokeMethod("capture", arguments: capture) }
+      self?.onEvent?("capture", capture)
     }
     collector.onDiagnostic = { [weak self] diagnostic in
-      DispatchQueue.main.async { self?.channel.invokeMethod("diagnostic", arguments: diagnostic) }
+      self?.onEvent?("diagnostic", diagnostic)
+    }
+    collector.onOwnedComposerClaims = { [weak self] claims in
+      self?.onEvent?("ownedComposers", ["claims": claims])
     }
     ocrInspector.onFailedSendInspection = { [weak self] inspection in
-      self?.channel.invokeMethod("failedSendCandidates", arguments: inspection)
+      self?.onEvent?("failedSendCandidates", inspection)
     }
     ocrInspector.customerIdentityProvider = { [weak collector] in
       collector?.activeCustomerIdentity()
@@ -48,8 +110,16 @@ final class AccessibilityBridge {
     }
   }
 
-  private func handle(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
+  func restoreOwnedComposerClaims(_ claims: [String: String]) {
+    collector.restoreOwnedComposerClaims(claims)
+  }
+
+  func handle(_ call: NativeAutomationRequest, result: @escaping FlutterResult) {
     switch call.method {
+    case "workerStatus":
+      var value = collector.status()
+      value["available"] = true
+      result(value)
     case "status": result(collector.status())
     case "requestAccessibility": result(collector.requestAccessibility())
     case "requestScreenRecording": result(ocrInspector.requestScreenRecording())
@@ -75,15 +145,37 @@ final class AccessibilityBridge {
           .map { Date(timeIntervalSince1970: $0.doubleValue / 1000) },
         allowActivationForVideoDetection:
           args?["allowActivationForVideoDetection"] as? Bool ?? false,
+        allowMessageReferenceLookup: args?["allowMessageReferenceLookup"] as? Bool ?? true,
+        allowAttachmentPreview: args?["allowAttachmentPreview"] as? Bool ?? false,
+        previewTextRegions: (args?["previewTextRegions"] as? [[String: NSNumber]] ?? []).map {
+          CGRect(x: $0["x"]?.doubleValue ?? -1, y: $0["y"]?.doubleValue ?? -1,
+                 width: $0["width"]?.doubleValue ?? 0, height: $0["height"]?.doubleValue ?? 0)
+        },
+        sourcePNG: (args?["sourcePngBase64"] as? String).flatMap { Data(base64Encoded: $0) },
+        sourceSenderY: (args?["sourceSenderY"] as? NSNumber)?.doubleValue,
         completion: result)
-    case "captureRecentCachedMedia":
+    case "probeRecentCachedMedia":
       let args = call.arguments as? [String: Any]
-      collector.captureRecentCachedMedia(
+      collector.probeRecentCachedMedia(
         expectedCustomer: args?["expectedCustomer"] as? String ?? "",
         expectedMediaAt: (args?["expectedMediaAtMs"] as? NSNumber)
           .map { Date(timeIntervalSince1970: $0.doubleValue / 1000) },
+        completion: result)
+    case "captureRecentCachedVideo":
+      let args = call.arguments as? [String: Any]
+      collector.captureRecentCachedVideo(
+        expectedCustomer: args?["expectedCustomer"] as? String ?? "",
+        windowID: CGWindowID((args?["windowId"] as? NSNumber)?.uint32Value ?? 0),
+        expectedMediaAt: (args?["expectedMediaAtMs"] as? NSNumber)
+          .map { Date(timeIntervalSince1970: $0.doubleValue / 1000) },
+        competingMessageTimes: (args?["competingMessageTimesMs"] as? [NSNumber] ?? [])
+          .map { Date(timeIntervalSince1970: $0.doubleValue / 1000) },
         destinationDirectory: args?["destinationDirectory"] as? String ?? "",
         completion: result)
+    case "beginAttachmentDownload":
+      collector.beginAttachmentDownload(call.arguments as? [String: Any] ?? [:], completion: result)
+    case "pollAttachmentDownload":
+      collector.pollAttachmentDownload(call.arguments as? [String: Any] ?? [:], completion: result)
     case "classifyMessageAt":
       let args = call.arguments as? [String: Any]
       collector.classifyMessageAt(
@@ -109,7 +201,12 @@ final class AccessibilityBridge {
         normalizedY: (args?["y"] as? NSNumber)?.doubleValue ?? -1,
         normalizedWidth: (args?["width"] as? NSNumber)?.doubleValue ?? -1,
         normalizedHeight: (args?["height"] as? NSNumber)?.doubleValue ?? -1,
+        expectedMediaAt: (args?["expectedMediaAtMs"] as? NSNumber)
+          .map { Date(timeIntervalSince1970: $0.doubleValue / 1000) },
         destinationDirectory: args?["destinationDirectory"] as? String ?? "",
+        cacheReferenceToken: args?["cacheReferenceToken"] as? String,
+        sourcePNG: (args?["sourcePngBase64"] as? String).flatMap { Data(base64Encoded: $0) },
+        sourceSenderY: (args?["sourceSenderY"] as? NSNumber)?.doubleValue,
         completion: result)
     case "transcribeAudio":
       let args = call.arguments as? [String: Any]
@@ -135,9 +232,15 @@ final class AccessibilityBridge {
       collector.stop(); result(nil)
     case "inspectTree":
       let args = call.arguments as? [String: Any]
-      result(collector.inspectTree(maxDepth: args?["maxDepth"] as? Int ?? 12))
+      unreadSignalQueue.async {
+        let value = self.collector.inspectTree(maxDepth: args?["maxDepth"] as? Int ?? 12)
+        DispatchQueue.main.async { result(value) }
+      }
     case "listConversations":
-      result(collector.conversationIdentities())
+      unreadSignalQueue.async {
+        let value = self.collector.conversationIdentities()
+        DispatchQueue.main.async { result(value) }
+      }
     case "listConversationRows":
       // AX traversal plus badge OCR can take seconds. Running it on the
       // Flutter method-channel (main) thread prevents Dart's 20-second SLA
@@ -201,7 +304,7 @@ final class AccessibilityBridge {
         expectedCustomer: args?["expectedCustomer"] as? String ?? "",
         deltaY: (args?["deltaY"] as? NSNumber)?.int32Value ?? 0,
         completion: result)
-    default: result(FlutterMethodNotImplemented)
+    default: result(["error": "native_method_not_implemented"])
     }
   }
 }
@@ -302,6 +405,18 @@ final class QianniuOCRInspector {
   // behind a full media scan and miss the response deadline.
   private let accurateQueue = DispatchQueue(label: "jd.ocr.inspect.accurate", qos: .userInitiated)
   private let fastQueue = DispatchQueue(label: "jd.ocr.inspect.fast", qos: .userInitiated)
+  // Dart timeouts do not cancel a MethodChannel invocation. Without
+  // coalescing, every two-second poll can leave another synchronous Vision
+  // request queued here; later callers then wait minutes for screenshots that
+  // are already obsolete. Keep at most one request in flight per recognition
+  // level and give every overlapping caller the same freshly completed
+  // inspection. Customer identity is independently verified before and after
+  // the screenshot, so a caller still rejects a result for the wrong chat.
+  private let inspectionLock = NSLock()
+  private var accurateInspectionInFlight = false
+  private var fastInspectionInFlight = false
+  private var accurateInspectionWaiters: [FlutterResult] = []
+  private var fastInspectionWaiters: [FlutterResult] = []
   private let failedSendInspectionQueue = DispatchQueue(label: "jd.retry.inspect", qos: .utility)
   private let failedSendInspectionLock = NSLock()
   private var failedSendInspectionBusy = false
@@ -355,10 +470,29 @@ final class QianniuOCRInspector {
   }
 
   func inspect(windowID: CGWindowID?, recognitionLevel: String, completion: @escaping FlutterResult) {
-    let workQueue = recognitionLevel == "fast" ? fastQueue : accurateQueue
+    let fast = recognitionLevel == "fast"
+    inspectionLock.lock()
+    if fast {
+      fastInspectionWaiters.append(completion)
+      if fastInspectionInFlight {
+        inspectionLock.unlock()
+        return
+      }
+      fastInspectionInFlight = true
+    } else {
+      accurateInspectionWaiters.append(completion)
+      if accurateInspectionInFlight {
+        inspectionLock.unlock()
+        return
+      }
+      accurateInspectionInFlight = true
+    }
+    inspectionLock.unlock()
+
+    let workQueue = fast ? fastQueue : accurateQueue
     workQueue.async { [weak self] in
       guard let self else { return }
-      let response: [String: Any]
+      var response: [String: Any]
       do {
         response = try self.captureAndRecognize(
           windowID: windowID,
@@ -368,7 +502,22 @@ final class QianniuOCRInspector {
       } catch {
         response = ["error": "ocr_failed", "message": error.localizedDescription]
       }
-      DispatchQueue.main.async { completion(response) }
+      self.inspectionLock.lock()
+      let waiters: [FlutterResult]
+      if fast {
+        waiters = self.fastInspectionWaiters
+        self.fastInspectionWaiters.removeAll()
+        self.fastInspectionInFlight = false
+      } else {
+        waiters = self.accurateInspectionWaiters
+        self.accurateInspectionWaiters.removeAll()
+        self.accurateInspectionInFlight = false
+      }
+      self.inspectionLock.unlock()
+      response["coalescedRequests"] = waiters.count
+      DispatchQueue.main.async {
+        for waiter in waiters { waiter(response) }
+      }
     }
   }
 
@@ -543,6 +692,7 @@ final class QianniuOCRInspector {
       "recognizedText": observations.compactMap { $0["text"] as? String }.joined(separator: "\n"),
       "ocrEngine": "apple_vision",
       "activeCustomerId": customerAfterRecognition,
+      "activeCustomerIdentitySource": "ax_header_before_and_after",
       "capturedAtMs": Int(Date().timeIntervalSince1970 * 1000),
     ]
     if let chatFrame = chatFrameProvider?(), window.bounds.width > 0 {
@@ -658,6 +808,7 @@ private struct DownloadedVideoCandidate {
   let url: URL
   let modified: Date
   let size: Int
+  var matchBasis = "decoded_frame"
 }
 
 private struct JDCachedImageCandidate {
@@ -665,7 +816,99 @@ private struct JDCachedImageCandidate {
   let modified: Date
   let size: Int
   let fingerprint: String
+  let hashDistance: Int
   let score: Double
+}
+
+private struct JDRecentCachedMediaCandidate {
+  let kind: String
+  let url: URL
+  let modified: Date
+  let size: Int
+  let timeDelta: TimeInterval
+}
+
+private struct JDRecentCachedMediaSelection {
+  let candidate: JDRecentCachedMediaCandidate
+  let ambiguous: Bool
+  let candidateCount: Int
+}
+
+/// Shared-cache discovery. Callers must independently enforce the exact
+/// customer, competing clocks and file stability before copying any payload.
+private func recentJDCachedMedia(
+  expectedAt: Date,
+  now: Date = Date(),
+  maximumDelta: TimeInterval = 3 * 60,
+  timeout: TimeInterval = 5,
+  strictReceiveWindow: Bool = false
+) -> JDRecentCachedMediaSelection? {
+  let deadline = ProcessInfo.processInfo.systemUptime + timeout
+  let root = FileManager.default.homeDirectoryForCurrentUser
+    .appendingPathComponent("Library/Application Support/JingDong/咚咚工作台",
+                           isDirectory: true)
+  let keys: Set<URLResourceKey> = [
+    .contentModificationDateKey, .fileSizeKey, .isRegularFileKey,
+  ]
+  guard let enumerator = FileManager.default.enumerator(
+    at: root, includingPropertiesForKeys: Array(keys),
+    options: [.skipsHiddenFiles, .skipsPackageDescendants]) else { return nil }
+  let imageExtensions = Set(["jpg", "jpeg", "png", "webp", "heic"])
+  let videoExtensions = Set(["mp4", "mov", "m4v", "webm"])
+  var candidates: [JDRecentCachedMediaCandidate] = []
+  for case let url as URL in enumerator {
+    guard ProcessInfo.processInfo.systemUptime < deadline else { return nil }
+    let parent = url.deletingLastPathComponent()
+    let chatDirectory = parent.deletingLastPathComponent().lastPathComponent
+    let ext = url.pathExtension.lowercased()
+    let kind: String
+    let maximumSize: Int
+    if parent.lastPathComponent == "images" && imageExtensions.contains(ext) {
+      kind = "image"
+      maximumSize = 25 * 1024 * 1024
+    } else if parent.lastPathComponent == "videos" && videoExtensions.contains(ext) {
+      kind = "video"
+      maximumSize = 100 * 1024 * 1024
+    } else {
+      continue
+    }
+    guard chatDirectory.hasPrefix("chat_"),
+          let values = try? url.resourceValues(forKeys: keys),
+          values.isRegularFile == true,
+          let modified = values.contentModificationDate,
+          let size = values.fileSize,
+          size > 0, size <= maximumSize else { continue }
+    let age = now.timeIntervalSince(modified)
+    let delta = abs(modified.timeIntervalSince(expectedAt))
+    guard age >= -5, age <= 10 * 60, delta <= maximumDelta else { continue }
+    if strictReceiveWindow && !CustomerSafety.cacheVideoClockMatches(
+        modified: modified, expected: expectedAt, now: now, competing: []) { continue }
+    candidates.append(JDRecentCachedMediaCandidate(
+      kind: kind, url: url, modified: modified, size: size, timeDelta: delta))
+  }
+  guard !candidates.isEmpty else { return nil }
+
+  // JD stores a JPEG thumbnail beside many cached videos under the same base
+  // name. Treat that pair as one video, not two competing customer messages.
+  let videoKeys = Set(candidates.filter { $0.kind == "video" }.map {
+    $0.url.deletingLastPathComponent().deletingLastPathComponent().path + "/" +
+      $0.url.deletingPathExtension().lastPathComponent.lowercased()
+  })
+  let logical = candidates.filter {
+    $0.kind == "video" ||
+      !videoKeys.contains($0.url.deletingLastPathComponent().deletingLastPathComponent().path + "/" +
+        $0.url.deletingPathExtension().lastPathComponent.lowercased())
+  }.sorted {
+    if $0.timeDelta != $1.timeDelta { return $0.timeDelta < $1.timeDelta }
+    if $0.modified != $1.modified { return $0.modified > $1.modified }
+    return $0.url.path < $1.url.path
+  }
+  guard let best = logical.first else { return nil }
+  let ambiguous = logical.dropFirst().first.map {
+    $0.timeDelta < best.timeDelta + 4
+  } ?? false
+  return JDRecentCachedMediaSelection(
+    candidate: best, ambiguous: ambiguous, candidateCount: logical.count)
 }
 
 
@@ -712,8 +955,10 @@ private func matchingRecentJDCachedImage(
   let visibleRatio = Double(visibleImage.width) / Double(max(visibleImage.height, 1))
   let referenceTime = expectedAt ?? now
   var candidates: [JDCachedImageCandidate] = []
+  let deadline = ProcessInfo.processInfo.systemUptime + 1.5
 
   for case let url as URL in enumerator {
+    guard ProcessInfo.processInfo.systemUptime < deadline else { return nil }
     let parent = url.deletingLastPathComponent()
     let chatDirectory = parent.deletingLastPathComponent().lastPathComponent
     guard parent.lastPathComponent == "images",
@@ -733,17 +978,20 @@ private func matchingRecentJDCachedImage(
             forProposedRect: nil, context: nil, hints: nil) else { continue }
     let ratio = Double(cgImage.width) / Double(max(cgImage.height, 1))
     let ratioDelta = abs(log(max(ratio, 0.001) / max(visibleRatio, 0.001)))
-    guard ratioDelta <= 0.40 else { continue }
+    guard ratioDelta <= 0.80 else { continue }
     let fingerprint = averageImageHash(cgImage)
     guard let candidateBits = UInt64(fingerprint, radix: 16) else { continue }
     let hashDistance = (visibleBits ^ candidateBits).nonzeroBitCount
-    // Weak resemblance cannot bind a shared-cache image to this bubble.
-    // Keep the verified screenshot whenever the original is uncertain.
-    guard hashDistance <= 4, CustomerSafety.videoMatches(visibleImage, cgImage) else { continue }
+    // Prefer the cached original as in the fastest version, but bind it to
+    // visible customer pixels, not merely the newest shared-cache timestamp.
+    // JD may stretch/dim previews; a 64-bit hash alone is neither necessary
+    // nor sufficient evidence. Ambiguous originals still use the verified crop.
+    guard CustomerSafety.cachedThumbnailMatches(visibleImage, cgImage) ||
+      (hashDistance <= 4 && CustomerSafety.videoMatches(visibleImage, cgImage)) else { continue }
     let score = Double(hashDistance) * 4 + timeDelta / 5 + ratioDelta * 30
     candidates.append(JDCachedImageCandidate(
       url: url, modified: modified, size: size,
-      fingerprint: fingerprint, score: score))
+      fingerprint: fingerprint, hashDistance: hashDistance, score: score))
   }
 
   let ranked = candidates.sorted {
@@ -751,13 +999,14 @@ private func matchingRecentJDCachedImage(
     return $0.modified > $1.modified
   }
   guard let best = ranked.first else { return nil }
-  if ranked.count > 1 {
-    let next = ranked[1]
-    // Equal fingerprints are duplicate copies of the same visible content.
-    // Different-looking near-ties are unsafe in a shared multi-customer cache.
-    if next.fingerprint != best.fingerprint && next.score - best.score < 8 {
-      return nil
-    }
+  // A small perceptual hash cannot establish byte identity. If different
+  // originals resemble this bubble, keep the verified crop instead of choosing
+  // another customer's original by file time.
+  var digests = Set<String>()
+  for candidate in ranked {
+    guard let bytes = try? Data(contentsOf: candidate.url), bytes.count == candidate.size else { return nil }
+    digests.insert(SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined())
+    if digests.count > 1 { return nil }
   }
   return best
 }
@@ -771,8 +1020,81 @@ private enum JDVideoCacheCheck {
   case unresolved(String)
 }
 
+private enum JDMessageVideoReference {
+  case verified(String)
+  case unavailable(String)
+}
+
+private func referencedJDCachedVideo(saveAsName: String) -> JDVideoCacheCheck {
+  guard let stem = CustomerSafety.videoCacheStem(saveAsName: saveAsName) else {
+    return .unresolved("video_message_reference_invalid")
+  }
+  let deadline = ProcessInfo.processInfo.systemUptime + 2
+  let root = FileManager.default.homeDirectoryForCurrentUser
+    .appendingPathComponent("Library/Application Support/JingDong/咚咚工作台", isDirectory: true)
+  guard let enumerator = FileManager.default.enumerator(
+      at: root, includingPropertiesForKeys: nil,
+      options: [.skipsHiddenFiles, .skipsPackageDescendants]) else {
+    return .unresolved("video_cache_unavailable")
+  }
+  var candidates: [URL] = []
+  for case let url as URL in enumerator {
+    guard ProcessInfo.processInfo.systemUptime < deadline else {
+      return .unresolved("video_cache_check_timeout")
+    }
+    if url.deletingLastPathComponent().lastPathComponent == "videos" &&
+        CustomerSafety.videoCacheStem(saveAsName: url.lastPathComponent) == stem {
+      candidates.append(url)
+      if candidates.count > 40 { return .unresolved("video_message_reference_ambiguous") }
+    }
+  }
+  switch CustomerSafety.referencedCachedVideo(
+    saveAsName: saveAsName, candidates: candidates, deadline: deadline) {
+  case let .matched(url):
+    guard let values = try? url.resourceValues(forKeys: [.contentModificationDateKey, .fileSizeKey]),
+          let modified = values.contentModificationDate, let size = values.fileSize else {
+      return .unresolved("video_cache_changed_during_check")
+    }
+    return .matched(DownloadedVideoCandidate(
+      url: url, modified: modified, size: size, matchBasis: "verified_message_save_as_reference"))
+  case let .unresolved(reason): return .unresolved(reason)
+  case .notFound: return .notFound
+  }
+}
+
+/// A filename read from this exact message can identify a low-information
+/// image too. Do not choose by shared-cache time or preview colour.
+private func referencedJDCachedImage(saveAsName: String) -> URL? {
+  guard let stem = CustomerSafety.mediaCacheStem(saveAsName: saveAsName,
+      extensions: ["jpg", "jpeg", "png", "webp"]) else { return nil }
+  let root = FileManager.default.homeDirectoryForCurrentUser
+    .appendingPathComponent("Library/Application Support/JingDong/咚咚工作台")
+  let keys: Set<URLResourceKey> = [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey]
+  guard let files = FileManager.default.enumerator(at: root,
+      includingPropertiesForKeys: Array(keys), options: [.skipsHiddenFiles, .skipsPackageDescendants]) else { return nil }
+  let deadline = ProcessInfo.processInfo.systemUptime + 2
+  var matches: [(URL, String)] = []
+  for case let url as URL in files {
+    guard ProcessInfo.processInfo.systemUptime < deadline else { return nil }
+    let parent = url.deletingLastPathComponent()
+    guard parent.lastPathComponent == "images",
+          parent.deletingLastPathComponent().lastPathComponent.hasPrefix("chat_"),
+          CustomerSafety.mediaCacheStem(saveAsName: url.lastPathComponent) == stem,
+          ["jpg", "jpeg", "png", "webp"].contains(url.pathExtension.lowercased()),
+          url.resolvingSymlinksInPath().deletingLastPathComponent() == parent.standardizedFileURL,
+          let values = try? url.resourceValues(forKeys: keys),
+          values.isRegularFile == true, values.isSymbolicLink != true,
+          let size = values.fileSize, size > 0, size <= 25 * 1024 * 1024,
+          let bytes = try? Data(contentsOf: url), bytes.count == size,
+          CGImageSourceCreateWithData(bytes as CFData, nil) != nil else { continue }
+    matches.append((url, SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()))
+  }
+  guard CustomerSafety.uniqueVideoDigest(matches.map { $0.1 }) != nil else { return nil }
+  return matches.first?.0
+}
+
 private func matchingJDCachedVideo(
-  visibleImage: CGImage,
+  visibleImage: CGImage, expectedAt: Date? = nil,
   now: Date = Date(), maximumAge: TimeInterval = 5 * 60,
   timeout: TimeInterval = 8
 ) -> JDVideoCacheCheck {
@@ -805,13 +1127,32 @@ private func matchingJDCachedVideo(
     candidates.append(DownloadedVideoCandidate(
       url: url, modified: modified, size: size))
   }
-  // A recent file in another chat is not proof of ownership. Match decoded
-  // frames to the verified visible bubble and reject different matching clips.
-  guard CustomerSafety.videoSignature(visibleImage) != nil else { return .notFound }
-  var matched: DownloadedVideoCandidate?
-  var matchedDigest: String?
-  let ordered = candidates.sorted { $0.modified > $1.modified }
+  let referenceTime = expectedAt ?? now
+  let ordered = candidates.sorted {
+    let left = abs($0.modified.timeIntervalSince(referenceTime))
+    let right = abs($1.modified.timeIntervalSince(referenceTime))
+    if left != right { return left < right }
+    return $0.modified > $1.modified
+  }
   guard ordered.count <= 40 else { return .unresolved("video_cache_candidates_exceeded") }
+  // Cache-first, as in 819ce2a: use JD's original payload directly. The paired
+  // cached JPEG is the preview JD actually rendered; it need not equal any of
+  // the first three decoded MP4 frames. Verify all candidates before choosing.
+  switch CustomerSafety.pairedCachedVideo(
+    visible: visibleImage, candidates: ordered.map(\.url), deadline: deadline) {
+  case let .matched(url):
+    guard var candidate = ordered.first(where: { $0.url == url }) else { return .notFound }
+    candidate.matchBasis = "paired_cache_thumbnail"
+    return .matched(candidate)
+  case let .unresolved(reason):
+    return .unresolved(reason)
+  case .notFound:
+    break
+  }
+  // Older cache entries can lack a paired thumbnail. Retain decoded-frame
+  // verification as a secondary route, never a newest-file ownership shortcut.
+  guard CustomerSafety.videoSignature(visibleImage) != nil else { return .notFound }
+  var matches: [(candidate: DownloadedVideoCandidate, digest: String)] = []
   for candidate in ordered {
     guard ProcessInfo.processInfo.systemUptime < deadline else { return .unresolved("video_cache_check_timeout") }
     let generator = AVAssetImageGenerator(asset: AVURLAsset(url: candidate.url))
@@ -839,15 +1180,20 @@ private func matchingJDCachedVideo(
       return .unresolved("video_cache_changed_during_check")
     }
     let digest = SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()
-    if let previous = matchedDigest,
-       CustomerSafety.uniqueVideoDigest([previous, digest]) == nil {
-      return .unresolved("video_cache_match_ambiguous")
-    }
-    matched = matched ?? candidate
-    matchedDigest = digest
+    matches.append((candidate, digest))
   }
   guard ProcessInfo.processInfo.systemUptime < deadline else { return .unresolved("video_cache_check_timeout") }
-  return matched.map { .matched($0) } ?? .notFound
+  guard !matches.isEmpty else { return .notFound }
+  let ranked = matches.sorted {
+    let left = abs($0.candidate.modified.timeIntervalSince(referenceTime))
+    let right = abs($1.candidate.modified.timeIntervalSince(referenceTime))
+    if left != right { return left < right }
+    return $0.candidate.modified > $1.candidate.modified
+  }
+  guard CustomerSafety.uniqueVideoDigest(ranked.map(\.digest)) != nil else {
+    return .unresolved("video_cache_match_ambiguous")
+  }
+  return .matched(ranked[0].candidate)
 }
 
 private func windowBounds(_ id: CGWindowID) -> CGRect? {
@@ -1313,6 +1659,7 @@ private struct AXNode {
 final class QianniuAXCollector {
   var onCapture: (([String: Any]) -> Void)?
   var onDiagnostic: (([String: Any]) -> Void)?
+  var onOwnedComposerClaims: (([String: String]) -> Void)?
   private var failedSendRetries: [String: (attempts: Int, next: Date)] = [:]
 
   private let bundleIdentifier = "com.jd.jdmddwb"
@@ -1320,17 +1667,41 @@ final class QianniuAXCollector {
   // JD's cache tree can be slow to enumerate. It must not block the serial
   // AX queue used to send a time-bound customer holding message.
   private let videoCacheQueue = DispatchQueue(label: "jd.ax.video-cache", qos: .userInitiated)
+  private let attachmentFileQueue = DispatchQueue(label: "jd.ax.attachment-files",
+      qos: .userInitiated, attributes: .concurrent)
+  private var pendingAttachmentCleanup: (() -> Bool)?
   private var timer: DispatchSourceTimer?
   private var seenFingerprints = Set<String>()
   private var lastActiveConversation: String?
   private var pendingTransferCustomer: String?
+  private struct VerifiedVideoReference {
+    let customer: String
+    let window: CGWindowID
+    let snapshotDigest: String
+    let region: CGRect
+    let candidate: DownloadedVideoCandidate
+    let expires: TimeInterval
+  }
+  // Short-lived capability issued only after native message/cache verification.
+  // Reusing it avoids opening Save As a second time for a blank video preview.
+  private var verifiedVideoReferences: [String: VerifiedVideoReference] = [:]
   private struct OwnedComposer {
     let element: AXUIElement
     let text: String
   }
   // Queue-confined insertion ownership allows safe cleanup after a timed-out
   // read. Never erase unrelated operator text or another customer's composer.
-  private var ownedComposers: [String: OwnedComposer] = [:]
+  private var restoredComposerClaims: [String: String] = [:]
+  private var ownedComposers: [String: OwnedComposer] = [:] {
+    didSet { publishComposerClaims() }
+  }
+  func restoreOwnedComposerClaims(_ claims: [String: String]) {
+    // Called before dispatching a new request, never while a UI call is active.
+    restoredComposerClaims = claims.filter { ownedComposers[$0.key] == nil }
+  }
+  private func publishComposerClaims() {
+    onOwnedComposerClaims?(restoredComposerClaims.merging(ownedComposers.mapValues(\.text)) { _, current in current })
+  }
 
   func status() -> [String: Any] {
     let pid = runningPID()
@@ -1367,6 +1738,10 @@ final class QianniuAXCollector {
                           normalizedWidth: Double, normalizedHeight: Double,
                           expectedMediaAt: Date? = nil,
                           allowActivationForVideoDetection: Bool = false,
+                          allowMessageReferenceLookup: Bool = true,
+                          allowAttachmentPreview: Bool = false,
+                          previewTextRegions: [CGRect] = [],
+                          sourcePNG: Data? = nil, sourceSenderY: Double? = nil,
                           completion: @escaping FlutterResult) {
     queue.async { [weak self] in
       guard let self else { return }
@@ -1397,6 +1772,14 @@ final class QianniuAXCollector {
         y: CGFloat(normalizedY) * CGFloat(fullImage.height),
         width: CGFloat(normalizedWidth) * CGFloat(fullImage.width),
         height: CGFloat(normalizedHeight) * CGFloat(fullImage.height)).integral
+      guard let sourcePNG, let source = NSImage(data: sourcePNG)?.cgImage(
+              forProposedRect: nil, context: nil, hints: nil),
+            CustomerSafety.mediaSnapshotMatches(source: source, current: fullImage,
+              region: crop, senderY: sourceSenderY) else {
+        finish(["error": "media_snapshot_changed",
+                "message": "The sender/media pixels no longer match the OCR snapshot; refresh OCR before using any coordinates."])
+        return
+      }
       guard crop.width >= 40, crop.height >= 40,
             let image = fullImage.cropping(to: crop),
             activeCustomerIdentity().map({ exactCustomerIdentityMatches($0, expected) }) == true,
@@ -1406,49 +1789,12 @@ final class QianniuAXCollector {
                 "message": "The image region or active customer changed during capture."])
         return
       }
-      var videoDetected = looksLikeVideoThumbnail(image)
-      // JD renders the play control in a separate overlay layer that is absent
-      // from a window-only capture. When JD is frontmost, hover the verified
-      // bubble and inspect a bounded composite crop solely for classification.
-      let previouslyFrontmost = NSWorkspace.shared.frontmostApplication
-      let jdPID = runningPID()
-      var activatedForRetry = false
-      if !videoDetected && allowActivationForVideoDetection,
-         previouslyFrontmost?.processIdentifier != jdPID,
-         let jdPID,
-         let jdApp = NSRunningApplication(processIdentifier: jdPID) {
-        activatedForRetry = jdApp.activate(options: [.activateIgnoringOtherApps])
-        if activatedForRetry { usleep(200_000) }
-      }
-      defer {
-        if activatedForRetry,
-           let previous = previouslyFrontmost,
-           !previous.isTerminated {
-          _ = previous.activate(options: [.activateIgnoringOtherApps])
-        }
-      }
-      if !videoDetected,
-         NSWorkspace.shared.frontmostApplication?.processIdentifier == runningPID(),
-         let bounds = windowBounds(windowID) {
-        let screenCrop = CGRect(
-          x: bounds.minX + bounds.width * normalizedX,
-          y: bounds.minY + bounds.height * normalizedY,
-          width: bounds.width * normalizedWidth,
-          height: bounds.height * normalizedHeight).integral
-        _ = postHover(at: CGPoint(x: screenCrop.midX, y: screenCrop.midY))
-        if let composite = CGWindowListCreateImage(
-             screenCrop, .optionOnScreenOnly, kCGNullWindowID,
-             [.boundsIgnoreFraming, .bestResolution]) {
-          videoDetected = looksLikeVideoThumbnail(composite)
-        }
-      }
-      let detectedOnScreen = videoDetected
       // An absent play overlay is not proof of an image. Independently check
       // video-cache bytes before accepting the image path. Keep disk/decoder
       // work off the serial AX queue so reply delivery can continue.
       self.videoCacheQueue.async {
-        let check: JDVideoCacheCheck = detectedOnScreen ? .notFound :
-          matchingJDCachedVideo(visibleImage: image, timeout: 4)
+        let check = matchingJDCachedVideo(
+          visibleImage: image, expectedAt: expectedMediaAt, timeout: 3)
         func verifiedFinish(_ payload: [String: Any]) {
           self.queue.async {
             guard self.activeCustomerIdentity().map({ exactCustomerIdentityMatches($0, expected) }) == true,
@@ -1457,67 +1803,749 @@ final class QianniuAXCollector {
                       "message": "The verified customer changed during cache cross-check; nothing was assigned."])
               return
             }
-            finish(payload)
+            var verified = payload
+            verified["verifiedCustomerId"] = expected
+            verified["ownershipVerification"] = "visible_customer_region"
+            finish(verified)
           }
         }
-        let verifiedVideo: Bool
-        let cacheCheck: String
-        switch check {
-        case .matched:
-          verifiedVideo = true
-          cacheCheck = "matched_video"
-        case .notFound:
-          verifiedVideo = detectedOnScreen
-          cacheCheck = detectedOnScreen ? "play_control_detected" : "no_matching_video"
-        case .unresolved(let reason):
-          verifiedFinish(["error": reason, "cacheCrossCheck": "unresolved",
-                          "message": "Video-cache cross-check was incomplete or ambiguous; this media was not downgraded to an image."])
-          return
+        func finishVideo(_ candidate: DownloadedVideoCandidate) {
+          guard !AVURLAsset(url: candidate.url).tracks(withMediaType: .video).isEmpty else {
+            verifiedFinish(["error": "video_cache_invalid_original"])
+            return
+          }
+          self.queue.async {
+            guard self.activeCustomerIdentity().map({ exactCustomerIdentityMatches($0, expected) }) == true,
+                  windowIsOwnedBy(windowID, pid: ownerPID) else {
+              finish(["error": "media_customer_changed_during_cache_check"])
+              return
+            }
+            let now = ProcessInfo.processInfo.systemUptime
+            self.verifiedVideoReferences = self.verifiedVideoReferences.filter { $0.value.expires > now }
+            let token = UUID().uuidString
+            self.verifiedVideoReferences[token] = VerifiedVideoReference(
+              customer: expected, window: windowID,
+              snapshotDigest: SHA256.hash(data: sourcePNG).map { String(format: "%02x", $0) }.joined(),
+              region: crop, candidate: candidate, expires: now + 15)
+            finish(["kind": "video", "mimeType": "image/png", "extension": "png",
+              "dataBase64": png.base64EncodedString(), "visualFingerprint": averageImageHash(image),
+              "captureSource": "verified-video-cache-reference", "cacheReferenceToken": token,
+              "originalName": candidate.url.lastPathComponent,
+              "verifiedCustomerId": expected, "ownershipVerification": "visible_customer_region"])
+          }
         }
-        if !verifiedVideo,
-           let cached = matchingRecentJDCachedImage(
-             visibleImage: image, expectedAt: expectedMediaAt),
-           let data = try? Data(contentsOf: cached.url), data.count == cached.size,
-           let values = try? cached.url.resourceValues(forKeys: [.contentModificationDateKey, .fileSizeKey]),
-           values.fileSize == cached.size, values.contentModificationDate == cached.modified,
-           let cachedImage = NSImage(data: data),
-           let cachedCGImage = cachedImage.cgImage(forProposedRect: nil, context: nil, hints: nil) {
-          let ext = cached.url.pathExtension.lowercased()
+        func finishImage(_ url: URL) {
+          let keys: Set<URLResourceKey> = [.fileSizeKey, .contentModificationDateKey]
+          guard let before = try? url.resourceValues(forKeys: keys),
+                let data = try? Data(contentsOf: url), data.count == before.fileSize,
+                let after = try? url.resourceValues(forKeys: keys),
+                before.fileSize == after.fileSize, before.contentModificationDate == after.contentModificationDate,
+                let source = CGImageSourceCreateWithData(data as CFData, nil),
+                let cachedCGImage = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
+            verifiedFinish(["error": "image_cache_changed_during_copy"])
+            return
+          }
+          let ext = url.pathExtension.lowercased()
           let mime = ext == "png" ? "image/png" : (ext == "webp" ? "image/webp" : "image/jpeg")
           verifiedFinish([
             "kind": "image", "mimeType": mime, "extension": ext,
-            "originalName": cached.url.lastPathComponent,
+            "originalName": url.lastPathComponent,
             "dataBase64": data.base64EncodedString(),
             "visualFingerprint": averageImageHash(cachedCGImage),
-            "captureSource": "jd-image-cache", "cacheCrossCheck": cacheCheck,
+            "captureSource": "jd-image-cache", "cacheCrossCheck": "verified_original",
           ])
-          return
         }
-        verifiedFinish([
-          "kind": verifiedVideo ? "video" : "image", "mimeType": "image/png", "extension": "png",
-          "dataBase64": png.base64EncodedString(), "visualFingerprint": averageImageHash(image),
-          "captureSource": "verified-window-crop", "cacheCrossCheck": cacheCheck,
-          "mediaWidth": image.width, "mediaHeight": image.height,
-        ])
+        if case let .matched(candidate) = check { finishVideo(candidate); return }
+        if let cached = matchingRecentJDCachedImage(visibleImage: image, expectedAt: expectedMediaAt) {
+          // The images directory also contains video posters. A paired MP4
+          // wins over its JPEG; a poster is never a new image upload.
+          switch referencedJDCachedVideo(saveAsName: cached.url.deletingPathExtension().lastPathComponent) {
+          case let .matched(candidate): finishVideo(candidate); return
+          case .unresolved: break
+          case .notFound: finishImage(cached.url); return
+          }
+        }
+        // Retain this customer's visible evidence when its original cannot be
+        // identified. Never select a flat shared-cache file by colour/time or
+        // misrepresent a possible video poster as an original image.
+        if allowAttachmentPreview, expectedMediaAt != nil,
+           let senderY = sourceSenderY, senderY < normalizedY {
+          let localText = previewTextRegions.map {
+            CGRect(x: ($0.minX - normalizedX) / normalizedWidth,
+                   y: ($0.minY - normalizedY) / normalizedHeight,
+                   width: $0.width / normalizedWidth, height: $0.height / normalizedHeight)
+          }
+          if CustomerSafety.attachmentPreviewHasVisualEvidence(image, textRegions: localText) {
+            let reason: String
+            if case let .unresolved(value) = check { reason = value }
+            else { reason = "media_original_not_verified" }
+            verifiedFinish([
+              "kind": "attachment_preview", "mimeType": "image/png", "extension": "png",
+              "dataBase64": png.base64EncodedString(),
+              "visualFingerprint": averageImageHash(image),
+              "captureSource": "verified-window-preview", "cacheCrossCheck": reason,
+            ])
+            return
+          }
+        }
+        // No menus, Save As, speculative empty-block images or newest-file
+        // assignment. Other messages/customers continue after a bounded miss.
+        switch check {
+        case let .unresolved(reason): verifiedFinish(["error": reason])
+        default: verifiedFinish(["error": "media_original_not_verified"])
+        }
       }
     }
   }
 
-  /// The shared cache requires visible evidence, not an unread timestamp.
-  func captureRecentCachedMedia(expectedCustomer: String,
+  /// Discovery only. Customer ownership must be established separately against
+  /// a sender-bounded visible bubble; this method never reads/copies payloads.
+  func probeRecentCachedMedia(expectedCustomer: String,
                                 expectedMediaAt: Date?,
-                                destinationDirectory: String,
                                 completion: @escaping FlutterResult) {
-    completion(["kind": "none", "reason": "visible_media_verification_required"])
+    videoCacheQueue.async { [weak self] in
+      guard let self else { return }
+      func finish(_ payload: [String: Any]) {
+        DispatchQueue.main.async { completion(payload) }
+      }
+      let expected = expectedCustomer.trimmingCharacters(in: .whitespacesAndNewlines)
+      guard AXIsProcessTrusted(), !expected.isEmpty,
+            let expectedMediaAt,
+            activeCustomerIdentity().map({ exactCustomerIdentityMatches($0, expected) }) == true else {
+        finish(["candidateFound": false, "reason": "cache_probe_precondition_failed"])
+        return
+      }
+      guard let selection = recentJDCachedMedia(expectedAt: expectedMediaAt) else {
+        finish(["candidateFound": false, "reason": "no_recent_cache_candidate"])
+        return
+      }
+      guard activeCustomerIdentity().map({ exactCustomerIdentityMatches($0, expected) }) == true else {
+        finish(["candidateFound": false, "reason": "cache_customer_changed"])
+        return
+      }
+      finish([
+        "candidateFound": true,
+        "verifiedCustomerId": expected,
+        "kind": selection.candidate.kind,
+        "cacheSelectionAmbiguous": selection.ambiguous,
+        "cacheCandidateCount": selection.candidateCount,
+        "reason": "visible_customer_media_verification_required",
+      ])
+    }
   }
 
-  /// Copies a freshly received video from JD's local per-chat media cache.
-  /// AX and the sender-bounded OCR rectangle verify the active incoming bubble,
-  /// but this method deliberately performs no clicks or keyboard actions in JD.
+  /// Cache-first acquisition restored from 819ce2a. Only actual video files
+  /// qualify, so white/black posters and missing play overlays do not matter.
+  /// This method performs no screenshot, activation, click, or keyboard input.
+  func captureRecentCachedVideo(expectedCustomer: String, windowID: CGWindowID,
+                                expectedMediaAt: Date?, competingMessageTimes: [Date],
+                                destinationDirectory: String,
+                                completion: @escaping FlutterResult) {
+    videoCacheQueue.async { [weak self] in
+      guard let self else { return }
+      let budget = AccessibilityBudget(deadline: Date().addingTimeInterval(6))
+      defer { budget.close() }
+      func finish(_ payload: [String: Any]) {
+        DispatchQueue.main.async { completion(payload) }
+      }
+      let expected = expectedCustomer.trimmingCharacters(in: .whitespacesAndNewlines)
+      let destination = URL(fileURLWithPath: destinationDirectory, isDirectory: true).standardizedFileURL
+      guard AXIsProcessTrusted(), !expected.isEmpty, let expectedMediaAt,
+            let pid = runningPID(), windowIsOwnedBy(windowID, pid: pid),
+            activeCustomerIdentity().map({ exactCustomerIdentityMatches($0, expected) }) == true,
+            FileManager.default.fileExists(atPath: destination.path) else {
+        finish(["error": "video_download_precondition_failed"])
+        return
+      }
+      guard let selection = recentJDCachedMedia(expectedAt: expectedMediaAt,
+              maximumDelta: 60, timeout: 2, strictReceiveWindow: true),
+            !selection.ambiguous, selection.candidate.kind == "video" else {
+        finish(["kind": "none", "reason": "no_unique_recent_cache_video"])
+        return
+      }
+      let cached = selection.candidate
+      guard CustomerSafety.cacheVideoClockMatches(modified: cached.modified,
+              expected: expectedMediaAt, now: Date(), competing: competingMessageTimes) else {
+        finish(["kind": "none", "reason": "cache_video_competing_turn"])
+        return
+      }
+      let keys: Set<URLResourceKey> = [.fileSizeKey, .contentModificationDateKey]
+      guard budget.isCurrent,
+            cached.url.resolvingSymlinksInPath().deletingLastPathComponent() ==
+              cached.url.deletingLastPathComponent().standardizedFileURL,
+            let before = try? cached.url.resourceValues(forKeys: keys),
+            before.fileSize == cached.size, before.contentModificationDate == cached.modified,
+            let bytes = try? Data(contentsOf: cached.url), bytes.count == cached.size,
+            let after = try? cached.url.resourceValues(forKeys: keys),
+            after.fileSize == before.fileSize, after.contentModificationDate == before.contentModificationDate,
+            activeCustomerIdentity().map({ exactCustomerIdentityMatches($0, expected) }) == true else {
+        finish(["error": "video_cache_changed_during_check"])
+        return
+      }
+      let digest = SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()
+      let cacheKey = sha256("\(cached.url.standardizedFileURL.path)\u{1f}\(cached.modified.timeIntervalSince1970)\u{1f}\(cached.size)")
+      let file = destination.appendingPathComponent("\(digest).\(cached.url.pathExtension.lowercased())")
+      var created = false
+      do {
+        if FileManager.default.fileExists(atPath: file.path) {
+          guard file.resolvingSymlinksInPath().deletingLastPathComponent() == destination.resolvingSymlinksInPath(),
+                (try? Data(contentsOf: file)) == bytes else {
+            finish(["error": "video_copy_owner_mismatch"])
+            return
+          }
+        } else {
+          try bytes.write(to: file, options: .atomic)
+          created = true
+        }
+      } catch {
+        finish(["error": "video_copy_failed"])
+        return
+      }
+      guard budget.isCurrent, windowIsOwnedBy(windowID, pid: pid),
+            activeCustomerIdentity().map({ exactCustomerIdentityMatches($0, expected) }) == true,
+            (try? file.resourceValues(forKeys: [.fileSizeKey]))?.fileSize == cached.size else {
+        if created { try? FileManager.default.removeItem(at: file) }
+        finish(["error": "video_copy_verification_failed"])
+        return
+      }
+      let ext = cached.url.pathExtension.lowercased()
+      finish(["kind": "video", "path": file.path,
+        "originalName": cached.url.lastPathComponent,
+        "mimeType": ext == "mov" || ext == "m4v" ? "video/quicktime" :
+          (ext == "webm" ? "video/webm" : "video/mp4"),
+        "size": cached.size, "cacheKey": cacheKey, "createdCopy": created,
+        "cacheModifiedAtMs": Int(cached.modified.timeIntervalSince1970 * 1000),
+        "expectedMediaAtMs": Int(expectedMediaAt.timeIntervalSince1970 * 1000),
+        "verifiedCustomerId": expected, "ownershipVerification": "exact_customer_unique_cache_clock",
+        "captureSource": "jd-video-cache", "cacheMatchBasis": "819ce2a_cache_first"])
+    }
+  }
+
+  private func mediaSavePanelNodes(pid: pid_t) -> [AXNode] {
+    var nodes: [AXNode] = []
+    walk(AXUIElementCreateApplication(pid), path: "app", depth: 0,
+         maxDepth: 18, maxNodes: 2_500) { node, _ in nodes.append(node) }
+    // Remote NSSavePanel elements can have another PID but are still reached
+    // through JD's own AX hierarchy. Never search unrelated apps for a dialog.
+    let names = nodes.filter { $0.identifier == "saveAsNameTextField" }
+    let panels = nodes.filter { node in node.identifier == "save-panel" ||
+      ((node.role == kAXSheetRole as String || node.role == kAXWindowRole as String) &&
+       node.title?.contains("咚咚融合工作台") != true &&
+       names.contains { $0.path.hasPrefix(node.path + "/") }) }
+    return nodes.filter { node in panels.contains {
+      node.path == $0.path || node.path.hasPrefix($0.path + "/")
+    } }
+  }
+
+  /// Bounded exact-message export. Called only by the explicit fallback after
+  /// cache acquisition fails; menu/dialog cleanup is mandatory before return.
+  private func videoReferenceFromMessage(expected: String, windowID: CGWindowID,
+                                         region: CGRect, originalImage: CGImage,
+                                         sourceSenderY: Double?,
+                                         exportDirectory: URL,
+                                         allowActivation: Bool = true,
+                                         expiresAt: TimeInterval) -> JDMessageVideoReference {
+    let budget = AccessibilityBudget(deadline: Date().addingTimeInterval(8),
+                                     uptimeDeadline: expiresAt)
+    defer { budget.close() }
+    guard budget.isCurrent, let pid = runningPID(),
+          windowIsOwnedBy(windowID, pid: pid), let bounds = windowBounds(windowID),
+          activeCustomerIdentity().map({ exactCustomerIdentityMatches($0, expected) }) == true,
+          mediaSavePanelNodes(pid: pid).isEmpty,
+          let app = NSRunningApplication(processIdentifier: pid) else {
+      return .unavailable("video_message_reference_precondition_failed")
+    }
+    let point = CGPoint(x: bounds.minX + region.midX * bounds.width / CGFloat(originalImage.width),
+                        y: bounds.minY + region.midY * bounds.height / CGFloat(originalImage.height))
+    // JingMai embeds this LSUIElement/accessory process inside its regular
+    // launcher. macOS can report the launcher as frontmost while the exact
+    // child window owns the click. Verify BOTH process family and hit window.
+    let launcher = NSRunningApplication.runningApplications(withBundleIdentifier: "com.jd.jingmaiMac")
+      .first { parent in
+        guard !parent.isTerminated, let root = parent.bundleURL?.standardizedFileURL.path,
+              let child = app.bundleURL?.standardizedFileURL.path else { return false }
+        return child.hasPrefix(root + "/Contents/")
+      }
+    func matchesReceptionWindow(_ element: AXUIElement) -> Bool {
+      guard stringAttribute(element, kAXRoleAttribute) == kAXWindowRole as String,
+            stringAttribute(element, kAXTitleAttribute)?.contains("咚咚融合工作台") == true,
+            let frame = frameAttribute(element) else { return false }
+      return abs(frame.minX - bounds.minX) <= 2 && abs(frame.minY - bounds.minY) <= 2 &&
+        abs(frame.width - bounds.width) <= 2 && abs(frame.height - bounds.height) <= 2
+    }
+    let axApp = AXUIElementCreateApplication(pid)
+    AXUIElementSetMessagingTimeout(axApp, 0.3)
+    let windows = elementArrayAttribute(axApp, kAXWindowsAttribute).filter(matchesReceptionWindow)
+    let receptionWindow = windows.count == 1 ? windows[0] :
+      (windows.isEmpty ? receptionNodes(pid: pid)?.first(where: { matchesReceptionWindow($0.element) })?.element : nil)
+    guard let receptionWindow else { return .unavailable("video_message_reference_window_unverified") }
+    func foreground(at point: CGPoint, allowOwnedOverlay: Bool = false) -> Bool {
+      // Window rectangles are NOT pointer hit tests: the Dock owns a nearly
+      // transparent full-screen layer. Ask AX which element actually receives
+      // this point, and prove its process and exact reception window instead.
+      let system = AXUIElementCreateSystemWide()
+      AXUIElementSetMessagingTimeout(system, 0.3)
+      var hit: AXUIElement?
+      guard budget.isCurrent,
+            accessibilityReadSucceeded(AXUIElementCopyElementAtPosition(system,
+              Float(point.x), Float(point.y), &hit)), let hit else { return false }
+      var hitPID: pid_t = 0
+      guard AXUIElementGetPid(hit, &hitPID) == .success, hitPID == pid else { return false }
+      var node: AXUIElement? = hit
+      var exactWindow = false
+      var ownedMenu = false
+      for _ in 0..<12 {
+        guard budget.isCurrent, let current = node else { break }
+        AXUIElementSetMessagingTimeout(current, 0.3)
+        var owner: pid_t = 0
+        guard AXUIElementGetPid(current, &owner) == .success, owner == pid else { return false }
+        let role = stringAttribute(current, kAXRoleAttribute)
+        ownedMenu = ownedMenu || role == kAXMenuRole as String || role == kAXMenuItemRole as String
+        if CFEqual(current, receptionWindow) ||
+            elementAttribute(current, kAXWindowAttribute).map({ CFEqual($0, receptionWindow) }) == true {
+          exactWindow = true
+          break
+        }
+        if role == kAXWindowRole as String || role == kAXApplicationRole as String { break }
+        node = elementAttribute(current, kAXParentAttribute)
+      }
+      return CustomerSafety.mediaReferenceForeground(workbenchPID: pid,
+        launcherPID: launcher?.processIdentifier,
+        frontmostPID: NSWorkspace.shared.frontmostApplication?.processIdentifier,
+        hitPID: hitPID, hitExpectedWindow: exactWindow, hitOwnedMenu: ownedMenu,
+        allowOwnedOverlay: allowOwnedOverlay)
+    }
+    if !foreground(at: point) {
+      guard allowActivation else { return .unavailable("media_reference_requires_activation") }
+      // Raise only the already-verified workbench window. No stale coordinates
+      // or arbitrary window-title click is used to obtain focus.
+      guard budget.isCurrent, matchesReceptionWindow(receptionWindow) else {
+        return .unavailable("video_message_reference_raise_unverified")
+      }
+      DispatchQueue.main.sync {
+        _ = (app.activationPolicy == .regular ? app : (launcher ?? app))
+          .activate(options: [.activateIgnoringOtherApps])
+      }
+      _ = AXUIElementPerformAction(receptionWindow, kAXRaiseAction as CFString)
+      for _ in 0..<24 {
+        if foreground(at: point) { break }
+        if !budget.isCurrent { break }
+        usleep(50_000)
+      }
+      guard foreground(at: point) else {
+        return .unavailable("video_message_reference_activation_failed")
+      }
+    }
+    // A user scroll/switch between native classification and menu opening must
+    // not silently redirect the selected message, even within the same buyer.
+    guard budget.isCurrent,
+          foreground(at: point),
+          let current = CGWindowListCreateImage(.null, .optionIncludingWindow, windowID,
+              [.boundsIgnoreFraming, .bestResolution]),
+          current.width == originalImage.width, current.height == originalImage.height,
+          windowBounds(windowID) == bounds,
+          CustomerSafety.mediaSnapshotMatches(source: originalImage, current: current,
+            region: region, senderY: sourceSenderY),
+          activeCustomerIdentity().map({ exactCustomerIdentityMatches($0, expected) }) == true else {
+      return .unavailable("video_message_changed_before_reference")
+    }
+    let menuBounds = CGRect(x: point.x - 300, y: point.y - 300, width: 700, height: 650)
+      .intersection(bounds)
+    guard let baseline = CGWindowListCreateImage(menuBounds, .optionOnScreenOnly,
+        kCGNullWindowID, [.boundsIgnoreFraming, .bestResolution]),
+        CustomerSafety.attachmentSaveTarget(recognizeTransferText(in: baseline).map {
+          CustomerSafety.AttachmentMenuLine(text: $0.text, confidence: $0.confidence, frame: $0.frame)
+        }) == nil, budget.isCurrent,
+        postRightClick(at: point) else { return .unavailable("video_message_menu_failed") }
+    self.pendingAttachmentCleanup = { [weak self] in
+      self?.closeAttachmentMenu(expected: expected, pid: pid, windowID: windowID,
+          menuBounds: menuBounds, baseline: baseline) ?? false
+    }
+    var savePoint: CGPoint?
+    // JD's menu often has not rendered 120 ms after the click. A bounded
+    // resnapshot is safe; clicking the former menu position is not.
+    for _ in 0..<3 {
+      guard budget.isCurrent,
+            windowBounds(windowID) == bounds,
+            activeCustomerIdentity().map({ exactCustomerIdentityMatches($0, expected) }) == true,
+            foreground(at: point, allowOwnedOverlay: true),
+            let menuImage = CGWindowListCreateImage(menuBounds, .optionOnScreenOnly, kCGNullWindowID,
+                [.boundsIgnoreFraming, .bestResolution]) else { break }
+      let lines = recognizeTransferText(in: menuImage)
+      if let save = CustomerSafety.attachmentSaveTarget(lines.map {
+        CustomerSafety.AttachmentMenuLine(text: $0.text, confidence: $0.confidence, frame: $0.frame)
+      }) {
+          savePoint = CGPoint(
+            x: menuBounds.minX + save.midX * menuBounds.width / CGFloat(menuImage.width),
+            y: menuBounds.minY + save.midY * menuBounds.height / CGFloat(menuImage.height))
+          break
+      }
+      usleep(100_000)
+    }
+    guard budget.isCurrent, let savePoint,
+          windowBounds(windowID) == bounds,
+          activeCustomerIdentity().map({ exactCustomerIdentityMatches($0, expected) }) == true,
+          foreground(at: savePoint, allowOwnedOverlay: true) else {
+      return .unavailable("video_message_save_action_unverified")
+    }
+    let accessibleSave = receptionNodes(pid: pid)?.filter { node in
+      (node.role == kAXMenuItemRole as String || node.role == kAXButtonRole as String) &&
+        CustomerSafety.mediaMenuLabel(node.title ?? node.value ?? "") == "另存为" &&
+        node.actions.contains(kAXPressAction as String) && node.frame?.contains(savePoint) == true
+    } ?? []
+    let pressed = accessibleSave.count == 1
+      ? AXUIElementPerformAction(accessibleSave[0].element, kAXPressAction as CFString) == .success
+      : postClick(at: savePoint)
+    guard pressed else { return .unavailable("video_message_save_action_failed") }
+    for _ in 0..<6 {
+      guard budget.isCurrent else { break }
+      usleep(100_000)
+      let panel = mediaSavePanelNodes(pid: pid)
+      let names = panel.filter { $0.identifier == "saveAsNameTextField" }
+      let cancels = panel.filter { $0.identifier == "CancelButton" && $0.actions.contains(kAXPressAction as String) }
+      if names.count == 1 && cancels.count == 1 {
+        self.pendingAttachmentCleanup = { [weak self] in
+          self?.cancelOwnedAttachmentPanel(pid: pid, cancel: cancels[0].element) ?? false
+        }
+      }
+      guard names.count == 1, cancels.count == 1 else { continue }
+      let name = stringAttribute(names[0].element, kAXValueAttribute) ?? ""
+      guard let filename = CustomerSafety.safeAttachmentFilename(name),
+            self.setAttachmentExportDirectory(pid: pid, name: names[0].element,
+                directory: exportDirectory, budget: budget),
+            budget.isCurrent,
+            activeCustomerIdentity().map({ exactCustomerIdentityMatches($0, expected) }) == true else {
+        return .unavailable("video_message_reference_invalid")
+      }
+      let finalPanel = mediaSavePanelNodes(pid: pid)
+      let saveButtons = finalPanel.filter { node in
+        node.role == kAXButtonRole as String && node.actions.contains(kAXPressAction as String) &&
+          ["存储", "保存", "Save"].contains(node.title ?? "")
+      }
+      guard saveButtons.count == 1,
+            stringAttribute(names[0].element, kAXValueAttribute) == name,
+            AXUIElementPerformAction(saveButtons[0].element, kAXPressAction as CFString) == .success else {
+        return .unavailable("attachment_export_save_unverified")
+      }
+      for _ in 0..<6 {
+        if !budget.isCurrent || mediaSavePanelNodes(pid: pid).isEmpty { break }
+        usleep(60_000)
+      }
+      guard budget.isCurrent, mediaSavePanelNodes(pid: pid).isEmpty,
+            windowIsOwnedBy(windowID, pid: pid),
+            activeCustomerIdentity().map({ exactCustomerIdentityMatches($0, expected) }) == true else {
+        return .unavailable("video_message_reference_final_verification_failed")
+      }
+      self.pendingAttachmentCleanup = nil
+      return .verified(filename)
+    }
+    return .unavailable("video_message_save_panel_unavailable")
+  }
+
+  private func cancelOwnedAttachmentPanel(pid: pid_t, cancel: AXUIElement) -> Bool {
+    let budget = AccessibilityBudget(deadline: Date().addingTimeInterval(1.5))
+    defer { budget.close() }
+    for _ in 0..<3 {
+      let nodes = mediaSavePanelNodes(pid: pid)
+      if nodes.isEmpty && budget.isCurrent { return true }
+      // Cancel a nested Go To sheet before its containing Save panel. All
+      // candidates come from JD's owned panel hierarchy, not the global AX tree.
+      let enabled = nodes.filter { node in
+        (node.identifier == "CancelButton" || node.identifier == "CloseButton" ||
+          ["取消", "Cancel"].contains(node.title ?? "")) &&
+          node.role == kAXButtonRole as String && node.actions.contains(kAXPressAction as String) &&
+          boolAttribute(node.element, kAXEnabledAttribute) == true
+      }
+      let deepest = enabled.sorted { $0.path.count > $1.path.count }
+      let target = deepest.first?.element ?? cancel
+      guard budget.isCurrent,
+            AXUIElementPerformAction(target, kAXPressAction as CFString) == .success else { return false }
+      usleep(100_000)
+    }
+    return budget.isCurrent && mediaSavePanelNodes(pid: pid).isEmpty
+  }
+
+  private func closeAttachmentMenu(expected: String, pid: pid_t, windowID: CGWindowID,
+                                   menuBounds: CGRect, baseline: CGImage) -> Bool {
+    let budget = AccessibilityBudget(deadline: Date().addingTimeInterval(1.5))
+    defer { budget.close() }
+    guard windowIsOwnedBy(windowID, pid: pid),
+          activeCustomerIdentity().map({ exactCustomerIdentityMatches($0, expected) }) == true else { return false }
+    // A delayed Save panel must be cancelled through its owned AX control.
+    // Never capture the screen while the native Save panel is present.
+    let panels = mediaSavePanelNodes(pid: pid)
+    let cancels = panels.filter { $0.identifier == "CancelButton" && $0.actions.contains(kAXPressAction as String) }
+    if !panels.isEmpty {
+      return cancels.count == 1 && cancelOwnedAttachmentPanel(pid: pid, cancel: cancels[0].element)
+    }
+    guard budget.isCurrent,
+          let image = CGWindowListCreateImage(menuBounds, .optionOnScreenOnly, kCGNullWindowID,
+              [.boundsIgnoreFraming, .bestResolution]) else { return false }
+    func sameAsBaseline(_ current: CGImage) -> Bool {
+      CustomerSafety.mediaSnapshotMatches(source: baseline, current: current,
+          region: CGRect(x: 0, y: 0, width: baseline.width, height: baseline.height), senderY: 0)
+    }
+    if sameAsBaseline(image) { return true } // No popup actually opened.
+    let menu = CustomerSafety.attachmentSaveTarget(recognizeTransferText(in: image).map {
+      CustomerSafety.AttachmentMenuLine(text: $0.text, confidence: $0.confidence, frame: $0.frame)
+    })
+    guard menu != nil, budget.isCurrent,
+          NSWorkspace.shared.frontmostApplication?.processIdentifier == pid else { return false }
+    // This Escape is PID-targeted and requires a newly verified complete menu.
+    // It is not the former unconditional/global Escape that closed a chat.
+    guard postKeyToPID(pid, key: 53, flags: []) else { return false }
+    usleep(80_000)
+    guard budget.isCurrent,
+          activeCustomerIdentity().map({ exactCustomerIdentityMatches($0, expected) }) == true,
+          let after = CGWindowListCreateImage(menuBounds, .optionOnScreenOnly, kCGNullWindowID,
+              [.boundsIgnoreFraming, .bestResolution]) else { return false }
+    return sameAsBaseline(after)
+  }
+
+  private func setAttachmentExportDirectory(pid: pid_t, name: AXUIElement,
+      directory: URL, budget: AccessibilityBudget) -> Bool {
+    let before = mediaSavePanelNodes(pid: pid)
+    guard budget.isCurrent,
+          AXUIElementSetAttributeValue(name, kAXFocusedAttribute as CFString, kCFBooleanTrue) == .success,
+          attachmentPanelIsFrontmost(pid: pid, focused: name),
+          postCommandShiftG() else { return false }
+    for _ in 0..<8 {
+      guard budget.isCurrent else { return false }
+      usleep(60_000)
+      let nodes = mediaSavePanelNodes(pid: pid)
+      let newFields = nodes.filter { node in
+        (node.role == kAXTextFieldRole as String || node.role == kAXComboBoxRole as String) &&
+          node.identifier != "saveAsNameTextField" &&
+          !before.contains(where: { CFEqual($0.element, node.element) })
+      }
+      let leaves = newFields.filter { field in
+        !newFields.contains { $0.path.hasPrefix(field.path + "/") }
+      }
+      let go = nodes.filter { node in node.role == kAXButtonRole as String &&
+        ["前往", "Go", "转到"].contains(node.title ?? "") && node.actions.contains(kAXPressAction as String) }
+      guard leaves.count == 1 else { continue }
+      let path = leaves[0]
+      // Modern macOS has no Go button. Its advertised AXConfirm can return
+      // success without navigating; Return works, but only in this exact,
+      // owned Go To field with its verified path and actual keyboard focus.
+      let modernPath = path.identifier == "PathTextField" &&
+        nodes.contains { $0.identifier == "GoToWindow" && path.path.hasPrefix($0.path + "/") }
+      guard modernPath || go.count == 1 else { continue }
+      guard AXUIElementSetAttributeValue(path.element, kAXValueAttribute as CFString,
+              directory.path as CFTypeRef) == .success,
+            stringAttribute(path.element, kAXValueAttribute) == directory.path else { return false }
+      if modernPath {
+        guard budget.isCurrent,
+              AXUIElementSetAttributeValue(path.element, kAXFocusedAttribute as CFString, kCFBooleanTrue) == .success,
+              stringAttribute(path.element, kAXValueAttribute) == directory.path,
+              attachmentPanelIsFrontmost(pid: pid, focused: path.element),
+              let down = CGEvent(keyboardEventSource: nil, virtualKey: 36, keyDown: true),
+              let up = CGEvent(keyboardEventSource: nil, virtualKey: 36, keyDown: false) else { return false }
+        down.post(tap: .cghidEventTap); up.post(tap: .cghidEventTap)
+      } else if AXUIElementPerformAction(go[0].element, kAXPressAction as CFString) != .success {
+        return false
+      }
+      for _ in 0..<8 {
+        guard budget.isCurrent else { return false }
+        usleep(60_000)
+        let ready = mediaSavePanelNodes(pid: pid)
+        // The destination's random operation-directory name is unique. Accept
+        // only its selected-folder/path control, never the Go To text field.
+        let selected = ready.contains { node in
+          [kAXPopUpButtonRole as String, kAXMenuButtonRole as String, "AXPathControl"].contains(node.role) &&
+            (node.title == directory.lastPathComponent || node.value == directory.lastPathComponent || node.value == directory.path ||
+             node.value == directory.absoluteString)
+        }
+        if selected { return true }
+      }
+      return false
+    }
+    return false
+  }
+
+  private func attachmentPanelIsFrontmost(pid: pid_t, focused: AXUIElement) -> Bool {
+    guard let frontmost = NSWorkspace.shared.frontmostApplication,
+          let workbench = NSRunningApplication(processIdentifier: pid) else { return false }
+    if frontmost.processIdentifier != pid {
+      guard frontmost.bundleIdentifier == "com.jd.jingmaiMac",
+            let parent = frontmost.bundleURL?.standardizedFileURL.path,
+            workbench.bundleURL?.standardizedFileURL.path.hasPrefix(parent + "/Contents/") == true else { return false }
+    }
+    // A verified modal text field must actually own keyboard focus immediately
+    // before Cmd-Shift-G. No shortcut is posted into an unverified chat/app.
+    guard boolAttribute(focused, kAXFocusedAttribute) == true else { return false }
+    // AXFocusedUIElement is an application attribute; some macOS versions
+    // expose no such value on the system-wide element. Verify the field's
+    // focused state plus its owned Save-panel ancestry instead.
+    var target: AXUIElement? = focused
+    for _ in 0..<8 {
+      guard let node = target else { break }
+      if stringAttribute(node, kAXIdentifierAttribute) == "save-panel" { return true }
+      target = elementAttribute(node, kAXParentAttribute)
+    }
+    return false
+  }
+
+  /// UI-only preparation. Return as soon as the exact-message export is
+  /// started and all menus/panels are closed. No file waiting on this queue.
+  func beginAttachmentDownload(_ args: [String: Any], completion: @escaping FlutterResult) {
+    queue.async { [weak self] in
+      guard let self else { return }
+      let deadline = (args["operationDeadlineMs"] as? NSNumber).map {
+        Date(timeIntervalSince1970: $0.doubleValue / 1000) } ?? Date()
+      let budget = AccessibilityBudget(deadline: min(deadline, Date().addingTimeInterval(8)))
+      let expected = args["expectedCustomer"] as? String ?? ""
+      let windowID = CGWindowID((args["windowId"] as? NSNumber)?.uint32Value ?? 0)
+      let directory = URL(fileURLWithPath: args["destinationDirectory"] as? String ?? "", isDirectory: true).standardizedFileURL
+      var uiAttempted = false
+      let payload: [String: Any] = {
+        guard budget.isCurrent, AXIsProcessTrusted(), !expected.isEmpty,
+              let pid = self.runningPID(), windowIsOwnedBy(windowID, pid: pid),
+              self.activeCustomerIdentity().map({ exactCustomerIdentityMatches($0, expected) }) == true,
+              let sentAt = args["expectedMediaAtMs"] as? NSNumber,
+              let eventKey = args["eventKey"] as? String, !eventKey.isEmpty,
+              directory.lastPathComponent.hasPrefix("attachment_"),
+              directory.deletingLastPathComponent().lastPathComponent == "attachment_exports",
+              directory.resolvingSymlinksInPath() == directory,
+              (try? FileManager.default.contentsOfDirectory(atPath: directory.path))?.isEmpty == true,
+              self.pendingAttachmentCleanup == nil,
+              let encoded = args["sourcePngBase64"] as? String,
+              let png = Data(base64Encoded: encoded),
+              let source = CGImageSourceCreateWithData(png as CFData, nil),
+              let original = CGImageSourceCreateImageAtIndex(source, 0, nil),
+              let current = CGWindowListCreateImage(.null, .optionIncludingWindow, windowID,
+                  [.boundsIgnoreFraming, .bestResolution]) else {
+          return ["error": "attachment_precondition_failed", "uiAttempted": false]
+        }
+        let x = (args["x"] as? NSNumber)?.doubleValue ?? -1
+        let y = (args["y"] as? NSNumber)?.doubleValue ?? -1
+        let width = (args["width"] as? NSNumber)?.doubleValue ?? -1
+        let height = (args["height"] as? NSNumber)?.doubleValue ?? -1
+        let senderY = (args["sourceSenderY"] as? NSNumber)?.doubleValue
+        guard x >= 0, y >= 0, width > 0, height > 0, x + width <= 1, y + height <= 1 else {
+          return ["error": "attachment_region_invalid", "uiAttempted": false]
+        }
+        let region = CGRect(x: x * Double(original.width), y: y * Double(original.height),
+            width: width * Double(original.width), height: height * Double(original.height)).integral
+        guard CustomerSafety.mediaSnapshotMatches(source: original, current: current, region: region, senderY: senderY) else {
+          return ["error": "media_snapshot_changed", "uiAttempted": false]
+        }
+        let reference = self.videoReferenceFromMessage(expected: expected, windowID: windowID,
+            region: region, originalImage: original, sourceSenderY: senderY,
+            exportDirectory: directory, expiresAt: ProcessInfo.processInfo.systemUptime + max(0, deadline.timeIntervalSinceNow))
+        switch reference {
+        case let .unavailable(reason):
+          uiAttempted = self.pendingAttachmentCleanup != nil
+          return ["error": reason, "uiAttempted": uiAttempted]
+        case let .verified(filename):
+          uiAttempted = true
+          let token = UUID().uuidString
+          let receipt: [String: Any] = ["token": token, "customer": expected,
+            "event_key": eventKey, "expectedMediaAtMs": sentAt,
+            "original_name": filename, "directory": directory.path,
+            "startedAtMs": Int(Date().timeIntervalSince1970 * 1000)]
+          do {
+            try JSONSerialization.data(withJSONObject: receipt).write(
+              to: directory.appendingPathComponent(".jd-attachment-export.json"), options: .atomic)
+          } catch { return ["error": "attachment_receipt_write_failed", "uiAttempted": true] }
+          return ["state": "started", "token": token, "directory": directory.path,
+            "originalName": filename, "verifiedCustomerId": expected,
+            "expectedMediaAtMs": sentAt, "ownershipVerification": "exact_customer_attachment_reference"]
+        }
+      }()
+      budget.close()
+      var response = payload
+      if let cleanup = self.pendingAttachmentCleanup {
+        if cleanup() { self.pendingAttachmentCleanup = nil }
+        else { response = ["error": "attachment_ui_cleanup_failed", "uiAttempted": true] }
+      }
+      response["uiAttempted"] = uiAttempted
+      DispatchQueue.main.async { completion(response) }
+    }
+  }
+
+  /// File-only completion, scoped by a durable exact-message export receipt.
+  func pollAttachmentDownload(_ args: [String: Any], completion: @escaping FlutterResult) {
+    attachmentFileQueue.async {
+      func finish(_ value: [String: Any]) { DispatchQueue.main.async { completion(value) } }
+      let folder = URL(fileURLWithPath: args["directory"] as? String ?? "", isDirectory: true).standardizedFileURL
+      guard folder.lastPathComponent.hasPrefix("attachment_"),
+            folder.deletingLastPathComponent().lastPathComponent == "attachment_exports",
+            folder.resolvingSymlinksInPath() == folder,
+            let receiptData = try? Data(contentsOf: folder.appendingPathComponent(".jd-attachment-export.json")),
+            let receipt = (try? JSONSerialization.jsonObject(with: receiptData)) as? [String: Any],
+            let token = args["token"] as? String, token == receipt["token"] as? String,
+            let customer = args["customer"] as? String, customer == receipt["customer"] as? String,
+            args["event_key"] as? String == receipt["event_key"] as? String,
+            let sent = args["sent_at"] as? String,
+            let date = ISO8601DateFormatter.fractional.date(from: sent),
+            Int(date.timeIntervalSince1970 * 1000) == (receipt["expectedMediaAtMs"] as? NSNumber)?.intValue,
+            receipt["directory"] as? String == folder.path,
+            let original = receipt["original_name"] as? String,
+            CustomerSafety.safeAttachmentFilename(original) != nil else {
+        finish(["error": "attachment_receipt_unverified"]); return
+      }
+      let keys: Set<URLResourceKey> = [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey, .contentModificationDateKey]
+      let files = ((try? FileManager.default.contentsOfDirectory(at: folder,
+        includingPropertiesForKeys: Array(keys), options: [.skipsHiddenFiles])) ?? []).filter {
+          CustomerSafety.attachmentFilenameMatches($0.lastPathComponent, expected: original)
+        }
+      guard files.count == 1, let file = files.first,
+            file.resolvingSymlinksInPath().deletingLastPathComponent() == folder,
+            let before = try? file.resourceValues(forKeys: keys),
+            before.isRegularFile == true, before.isSymbolicLink != true,
+            let size = before.fileSize, size > 0, size <= 100 * 1024 * 1024,
+            let modified = before.contentModificationDate,
+            Date().timeIntervalSince(modified) >= 0.4,
+            let data = try? Data(contentsOf: file), data.count == size,
+            let after = try? file.resourceValues(forKeys: keys),
+            after.fileSize == size, after.contentModificationDate == modified,
+            let kind = CustomerSafety.attachmentContainerKind(data) else {
+        finish(["state": "pending"]); return
+      }
+      var result: [String: Any] = ["state": "ready", "token": token,
+        "verifiedCustomerId": customer, "expectedMediaAtMs": receipt["expectedMediaAtMs"]!,
+        "ownershipVerification": "exact_customer_attachment_reference",
+        "captureSource": "jd-attachment-export", "originalName": original]
+      if kind == "image" {
+        guard size <= 25 * 1024 * 1024,
+              let source = CGImageSourceCreateWithData(data as CFData, nil),
+              let type = CGImageSourceGetType(source) as String? else {
+          finish(["state": "pending"]); return
+        }
+        let ext = type.contains("jpeg") ? "jpg" : type.contains("gif") ? "gif" :
+          type.contains("webp") ? "webp" : type.contains("heic") ? "heic" : "png"
+        result["kind"] = "image"; result["extension"] = ext
+        result["mimeType"] = ext == "jpg" ? "image/jpeg" : "image/\(ext)"
+        result["originalName"] = (original as NSString).deletingPathExtension + "." + ext
+        result["dataBase64"] = data.base64EncodedString()
+      } else {
+        let asset = AVURLAsset(url: file)
+        let ready = DispatchSemaphore(value: 0)
+        asset.loadValuesAsynchronously(forKeys: ["tracks"]) { ready.signal() }
+        guard ready.wait(timeout: .now() + 1) == .success else {
+          asset.cancelLoading(); finish(["state": "pending"]); return
+        }
+        var error: NSError?
+        guard asset.statusOfValue(forKey: "tracks", error: &error) == .loaded,
+              !asset.tracks(withMediaType: .video).isEmpty else {
+          finish(["state": "pending"]); return
+        }
+        result["kind"] = "video"; result["path"] = file.path
+        result["mimeType"] = file.pathExtension.lowercased() == "mov" ? "video/quicktime" : "video/mp4"
+      }
+      finish(result)
+    }
+  }
+
+  /// Copy a visually matched cached original without any JD menu interaction.
   func downloadVideoAt(expectedCustomer: String, windowID: CGWindowID,
                        normalizedX: Double, normalizedY: Double,
                        normalizedWidth: Double, normalizedHeight: Double,
+                       expectedMediaAt: Date? = nil,
                        destinationDirectory: String,
+                       cacheReferenceToken: String? = nil,
+                       sourcePNG: Data? = nil, sourceSenderY: Double? = nil,
                        completion: @escaping FlutterResult) {
     videoCacheQueue.async { [weak self] in
       guard let self else { return }
@@ -1545,43 +2573,100 @@ final class QianniuAXCollector {
             x: CGFloat(normalizedX) * CGFloat(fullImage.width),
             y: CGFloat(normalizedY) * CGFloat(fullImage.height),
             width: CGFloat(normalizedWidth) * CGFloat(fullImage.width),
-            height: CGFloat(normalizedHeight) * CGFloat(fullImage.height)).integral),
-          case let .matched(cached) = matchingJDCachedVideo(visibleImage: visibleImage) else {
+            height: CGFloat(normalizedHeight) * CGFloat(fullImage.height)).integral) else {
+        finish(["error": "video_preview_capture_failed"])
+        return
+      }
+      let sourceRegion = CGRect(
+        x: CGFloat(normalizedX) * CGFloat(fullImage.width),
+        y: CGFloat(normalizedY) * CGFloat(fullImage.height),
+        width: CGFloat(normalizedWidth) * CGFloat(fullImage.width),
+        height: CGFloat(normalizedHeight) * CGFloat(fullImage.height)).integral
+      guard let sourcePNG, let source = NSImage(data: sourcePNG)?.cgImage(
+              forProposedRect: nil, context: nil, hints: nil),
+            CustomerSafety.mediaSnapshotMatches(source: source, current: fullImage,
+              region: sourceRegion, senderY: sourceSenderY) else {
+        finish(["error": "media_snapshot_changed",
+                "message": "The video no longer occupies the sender-bounded OCR region; refresh OCR before cache matching or UI actions."])
+        return
+      }
+      func copyCachedVideo(_ cached: DownloadedVideoCandidate) {
+        guard activeCustomerIdentity().map({ exactCustomerIdentityMatches($0, expected) }) == true,
+              windowIsOwnedBy(windowID, pid: ownerPID) else {
+          finish(["error": "video_copy_customer_changed"])
+          return
+        }
+        guard let bytes = try? Data(contentsOf: cached.url), bytes.count == cached.size,
+              let sourceValues = try? cached.url.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey]),
+              sourceValues.fileSize == cached.size,
+              sourceValues.contentModificationDate == cached.modified else {
+          finish(["error": "video_cache_changed_during_check"])
+          return
+        }
+        let digest = SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()
+        let file = destination.appendingPathComponent("\(digest).\(cached.url.pathExtension.lowercased())")
+        var created = false
+        do {
+          if FileManager.default.fileExists(atPath: file.path) {
+            guard file.resolvingSymlinksInPath().deletingLastPathComponent() == destination.resolvingSymlinksInPath(),
+                  let existing = try? Data(contentsOf: file), existing == bytes else {
+              finish(["error": "video_copy_owner_mismatch"])
+              return
+            }
+          } else {
+            try bytes.write(to: file, options: .atomic)
+            created = true
+          }
+        } catch {
+          finish(["error": "video_copy_failed",
+                  "message": "JD's cached video could not be copied into private storage."])
+          return
+        }
+        guard activeCustomerIdentity().map({ exactCustomerIdentityMatches($0, expected) }) == true,
+              let values = try? file.resourceValues(forKeys: [.fileSizeKey]),
+              let size = values.fileSize, size == cached.size else {
+          if created { try? FileManager.default.removeItem(at: file) }
+          finish(["error": "video_copy_verification_failed",
+                  "message": "The cached video changed during copying; the partial copy was removed."])
+          return
+        }
+        let ext = file.pathExtension.lowercased()
+        let mime = ext == "mov" || ext == "m4v" ? "video/quicktime" :
+          (ext == "webm" ? "video/webm" : "video/mp4")
+        finish([
+          "kind": "video",
+          "verifiedCustomerId": expected,
+          "ownershipVerification": "visible_customer_region",
+          "path": file.path,
+          "originalName": file.lastPathComponent,
+          "mimeType": mime,
+          "size": size,
+          "captureSource": "jd-video-cache",
+          "cacheMatchBasis": cached.matchBasis,
+        ])
+      }
+      var authorized: DownloadedVideoCandidate?
+      if let token = cacheReferenceToken {
+        // Access to native capabilities is serialized with the AX queue.
+        self.queue.sync {
+          if let reference = self.verifiedVideoReferences.removeValue(forKey: token),
+             reference.expires > ProcessInfo.processInfo.systemUptime,
+             reference.customer == expected, reference.window == windowID,
+             reference.region == sourceRegion,
+             reference.snapshotDigest == SHA256.hash(data: sourcePNG).map({ String(format: "%02x", $0) }).joined() {
+            authorized = reference.candidate
+          }
+        }
+      }
+      if let authorized { copyCachedVideo(authorized); return }
+      switch matchingJDCachedVideo(visibleImage: visibleImage, expectedAt: expectedMediaAt, timeout: 3) {
+      case let .matched(candidate):
+        copyCachedVideo(candidate)
+      case let .unresolved(reason): finish(["error": reason])
+      case .notFound:
         finish(["error": "video_download_not_found",
-                "message": "No unique video matched the verified visible thumbnail. Unrelated cache files were rejected."])
-        return
+                "message": "No unambiguous matching cache video is available; JD was left untouched."])
       }
-      var file = destination.appendingPathComponent(cached.url.lastPathComponent)
-      if FileManager.default.fileExists(atPath: file.path) {
-        file = destination.appendingPathComponent(
-          "\(UUID().uuidString).\(cached.url.pathExtension)")
-      }
-      do {
-        try FileManager.default.copyItem(at: cached.url, to: file)
-      } catch {
-        finish(["error": "video_copy_failed",
-                "message": "JD's cached video could not be copied into private storage."])
-        return
-      }
-      guard activeCustomerIdentity().map({ exactCustomerIdentityMatches($0, expected) }) == true,
-            let values = try? file.resourceValues(forKeys: [.fileSizeKey]),
-            let size = values.fileSize, size == cached.size else {
-        try? FileManager.default.removeItem(at: file)
-        finish(["error": "video_copy_verification_failed",
-                "message": "The cached video changed during copying; the partial copy was removed."])
-        return
-      }
-      let ext = file.pathExtension.lowercased()
-      let mime = ext == "mov" || ext == "m4v" ? "video/quicktime" :
-        (ext == "webm" ? "video/webm" : "video/mp4")
-      finish([
-        "kind": "video",
-        "path": file.path,
-        "originalName": file.lastPathComponent,
-        "mimeType": mime,
-        "size": size,
-        "captureSource": "jd-video-cache",
-      ])
     }
   }
 
@@ -2247,6 +3332,19 @@ final class QianniuAXCollector {
   }
 
   private func clearOwnedComposer(in nodes: [AXNode]) -> Bool {
+    // No Send/switch may run through a dialog our fallback failed to close.
+    if let cleanup = pendingAttachmentCleanup {
+      guard cleanup() else { return false }
+      pendingAttachmentCleanup = nil
+    }
+    if let owner = activeCustomerIdentity(in: nodes),
+       let claimed = restoredComposerClaims.removeValue(forKey: owner) {
+      if let composer = nodes.first(where: { $0.role == kAXTextAreaRole as String }),
+         stringAttribute(composer.element, kAXValueAttribute) == claimed,
+         activeCustomerMatches(owner, nodes: nodes) {
+        ownedComposers[owner] = OwnedComposer(element: composer.element, text: claimed)
+      } else { publishComposerClaims() }
+    }
     guard let owner = activeCustomerIdentity(in: nodes),
           let owned = ownedComposers[owner] else { return true }
     guard accessibilityReadAllowed(),
@@ -3391,6 +4489,14 @@ private func elementArrayAttribute(_ element: AXUIElement, _ attribute: String) 
   return value as? [AXUIElement] ?? []
 }
 
+private func elementAttribute(_ element: AXUIElement, _ attribute: String) -> AXUIElement? {
+  var value: CFTypeRef?
+  guard accessibilityReadAllowed(),
+        accessibilityReadSucceeded(AXUIElementCopyAttributeValue(element, attribute as CFString, &value)),
+        let value, CFGetTypeID(value) == AXUIElementGetTypeID() else { return nil }
+  return (value as! AXUIElement)
+}
+
 private func frameAttribute(_ element: AXUIElement) -> CGRect? {
   var positionValue: CFTypeRef?
   var sizeValue: CFTypeRef?
@@ -3445,6 +4551,25 @@ private func postCommandC() -> Bool {
   down.post(tap: .cghidEventTap)
   up.post(tap: .cghidEventTap)
   return true
+}
+
+/// Keyboard input is delivered only to the verified owning process, never to
+/// whichever unrelated app happens to become frontmost during cleanup.
+private func postKeyToPID(_ pid: pid_t, key: CGKeyCode, flags: CGEventFlags) -> Bool {
+  guard pid > 0,
+        let down = CGEvent(keyboardEventSource: nil, virtualKey: key, keyDown: true),
+        let up = CGEvent(keyboardEventSource: nil, virtualKey: key, keyDown: false) else { return false }
+  down.flags = flags; up.flags = flags
+  down.postToPid(pid); up.postToPid(pid)
+  return true
+}
+
+private extension ISO8601DateFormatter {
+  static var fractional: ISO8601DateFormatter {
+    let formatter = ISO8601DateFormatter()
+    formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    return formatter
+  }
 }
 
 private func postCommandV() -> Bool {
@@ -3625,6 +4750,17 @@ private func postClick(at point: CGPoint) -> Bool {
   down.post(tap: .cghidEventTap)
   up.post(tap: .cghidEventTap)
   usleep(100_000)
+  return true
+}
+
+private func postRightClick(at point: CGPoint) -> Bool {
+  guard let down = CGEvent(mouseEventSource: nil, mouseType: .rightMouseDown,
+                           mouseCursorPosition: point, mouseButton: .right),
+        let up = CGEvent(mouseEventSource: nil, mouseType: .rightMouseUp,
+                         mouseCursorPosition: point, mouseButton: .right) else { return false }
+  down.post(tap: .cghidEventTap)
+  up.post(tap: .cghidEventTap)
+  usleep(120_000)
   return true
 }
 

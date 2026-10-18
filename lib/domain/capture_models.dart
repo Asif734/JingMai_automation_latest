@@ -79,7 +79,8 @@ class CapturedMessage {
   final List<CapturedMedia> media;
 
   /// Positive receipt observed next to this exact outgoing bubble. This is
-  /// used only to recover uncertain sends, never to gate ordinary sending.
+  /// required before OCR can settle reply bookkeeping or recover an uncertain
+  /// send. It never gates generation or an ordinary Send attempt.
   final bool deliveryConfirmed;
 }
 
@@ -90,9 +91,16 @@ class CapturedMedia {
     this.mimeType,
     this.originalName,
     this.captureSource,
+    this.sourceEventKey,
     this.isPartial = false,
     this.description,
     this.visualFingerprint,
+    this.contentSha256,
+    this.verifiedCustomerId,
+    this.ownershipVerification,
+    this.speechTranscript,
+    this.speechLanguage,
+    this.speechConfidence,
   });
 
   factory CapturedMedia.fromMap(Map<Object?, Object?> map) => CapturedMedia(
@@ -102,10 +110,21 @@ class CapturedMedia {
         originalName: map['originalName'] as String?,
         captureSource:
             (map['captureSource'] ?? map['capture_source']) as String?,
+        sourceEventKey:
+            (map['sourceEventKey'] ?? map['source_event_key']) as String?,
         isPartial: (map['isPartial'] ?? map['is_partial']) == true,
         description: map['description'] as String?,
         visualFingerprint:
             (map['visualFingerprint'] ?? map['visual_fingerprint']) as String?,
+        contentSha256:
+            (map['contentSha256'] ?? map['content_sha256']) as String?,
+        verifiedCustomerId: (map['verifiedCustomerId'] ??
+            map['verified_customer_id']) as String?,
+        ownershipVerification: (map['ownershipVerification'] ??
+            map['ownership_verification']) as String?,
+        speechTranscript: map['speech_transcript'] as String?,
+        speechLanguage: map['speech_language'] as String?,
+        speechConfidence: (map['speech_confidence'] as num?)?.toDouble(),
       );
 
   final String type;
@@ -113,9 +132,16 @@ class CapturedMedia {
   final String? mimeType;
   final String? originalName;
   final String? captureSource;
+  final String? sourceEventKey;
   final bool isPartial;
   final String? description;
   final String? visualFingerprint;
+  final String? contentSha256;
+  final String? verifiedCustomerId;
+  final String? ownershipVerification;
+  final String? speechTranscript;
+  final String? speechLanguage;
+  final double? speechConfidence;
 
   Map<String, Object?> toJson() => {
         'type': type,
@@ -123,9 +149,18 @@ class CapturedMedia {
         'mime_type': mimeType,
         'original_name': originalName,
         'capture_source': captureSource,
+        if (sourceEventKey != null) 'source_event_key': sourceEventKey,
         'is_partial': isPartial,
         'description': description,
         'visual_fingerprint': visualFingerprint,
+        if (contentSha256 != null) 'content_sha256': contentSha256,
+        if (verifiedCustomerId != null)
+          'verified_customer_id': verifiedCustomerId,
+        if (ownershipVerification != null)
+          'ownership_verification': ownershipVerification,
+        if (speechTranscript != null) 'speech_transcript': speechTranscript,
+        if (speechLanguage != null) 'speech_language': speechLanguage,
+        if (speechConfidence != null) 'speech_confidence': speechConfidence,
       };
 }
 

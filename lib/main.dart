@@ -7,16 +7,24 @@ import 'package:flutter/services.dart';
 import 'package:crypto/crypto.dart';
 
 import 'capture/capture_coordinator.dart';
+import 'capture/attachment_download_queue.dart';
+import 'capture/media_acquisition.dart';
 import 'capture/failed_send_retry_policy.dart';
 import 'capture/ocr_capture_extractor.dart';
 import 'capture/ocr_image_candidate_selector.dart';
+import 'capture/ocr_media_mask.dart';
+import 'capture/reply_message_scope.dart';
 import 'capture/unread_capture_recovery.dart';
 import 'capture/video_audio_extractor.dart';
 import 'capture/video_frame_extractor.dart';
+import 'capture/video_capture_queue.dart';
 import 'codex/codex_reply_service.dart';
+import 'codex/customer_media_evidence.dart';
 import 'codex/holding_replies.dart';
+import 'codex/knowledge_inspection.dart';
 import 'codex/local_reply_router.dart';
 import 'domain/capture_models.dart';
+import 'domain/media_identity.dart';
 import 'platform/macos_capture_adapter.dart';
 import 'runtime/app_runtime.dart';
 import 'runtime/accessibility_permission_monitor.dart';
@@ -24,11 +32,13 @@ import 'runtime/app_error_state.dart';
 import 'runtime/automation_lease.dart';
 import 'runtime/installation_check.dart';
 import 'runtime/serial_delivery_worker.dart';
+import 'runtime/ui_operation_scheduler.dart';
 import 'storage/capture_database.dart';
+import 'storage/cache_video_claims.dart';
 import 'storage/diagnostic_log.dart';
-
-typedef _RunVideoProcessingUnlocked = Future<CapturedMessage?> Function(
-    Future<CapturedMessage?> Function() work);
+import 'storage/fallback_delivery_journal.dart';
+import 'storage/resilient_database.dart';
+import 'storage/reply_outbox.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -84,6 +94,11 @@ class _CaptureHomeState extends State<CaptureHome> {
   late final CaptureCoordinator _coordinator;
   late final CaptureDatabase _database;
   late final DiagnosticLog _diagnosticLog;
+  late final Future<FallbackDeliveryJournal> _fallbackJournal;
+  late final Future<ReplyOutbox> _replyOutbox;
+  late final Future<VideoCaptureQueue> _videoCaptureQueue;
+  late final Future<AttachmentDownloadQueue> _attachmentDownloads;
+  late final Future<CacheVideoClaims> _cacheVideoClaims;
   AutomationLease? _automationLease;
   AccessibilityPermissionMonitor? _permissionMonitor;
   StreamSubscription? _updateSubscription;
@@ -113,6 +128,7 @@ class _CaptureHomeState extends State<CaptureHome> {
   Timer? _deliveryRetryTimer;
   Timer? _deliveryRecoveryTimer;
   bool _deliveryRecoveryBusy = false;
+  bool _outboxRecoveryBusy = false;
   final Set<String> _draftQueue = {};
   // Each active customer owns a separate Codex CLI turn. Twenty
   // workers let the normal multi-chat workload generate concurrently without
@@ -121,8 +137,8 @@ class _CaptureHomeState extends State<CaptureHome> {
   final Set<String> _activeDraftUsers = {};
   final Map<String, CodexGenerationCancellation> _activeDraftCancellations = {};
   final Map<String, String> _activeDraftMessageIds = {};
-  Future<void> _jdUiTail = Future<void>.value();
-  int _pendingJdUiOperations = 0;
+  late final UiOperationScheduler _uiScheduler;
+  int get _pendingJdUiOperations => _uiScheduler.pendingCount;
   int _priorityUiOperations = 0;
   SerialDeliveryWorker<QueuedDelivery>? _deliveryWorker;
   bool get _deliveryWorkerRunning => _deliveryWorker?.isRunning ?? false;
@@ -133,7 +149,12 @@ class _CaptureHomeState extends State<CaptureHome> {
   final Map<String, String> _handledIncomingSenderKeys = {};
   final Map<String, DateTime> _lastUnreadProbeAt = {};
   final Map<String, UnreadCaptureRecovery> _unreadRecovery = {};
-  final Map<String, String> _claimedJdCacheMediaOwners = {};
+  final MediaAcquisitions _mediaAcquisitions = MediaAcquisitions();
+  final OcrMediaMasks _ocrMediaMasks = OcrMediaMasks();
+  final MediaEvidenceVersions _mediaEvidenceVersions = MediaEvidenceVersions();
+  final String _mediaEvidenceSession =
+      DateTime.now().microsecondsSinceEpoch.toString();
+  final SidebarUnreadTracker _sidebarUnreadTracker = SidebarUnreadTracker();
   final Set<String> _startingUnreadRecovery = {};
   final Map<String, Timer> _unreadHoldingTimers = {};
   final Map<String, Timer> _unreadResendTimers = {};
@@ -149,18 +170,68 @@ class _CaptureHomeState extends State<CaptureHome> {
   void initState() {
     super.initState();
     if (Platform.isMacOS) {
-      _database = CaptureDatabase();
+      _database = CaptureDatabase(onDatabaseRecovery: (error, attempt) {
+        _diagnosticLog.record('database.contention_recovered', fields: {
+          'attempt': attempt,
+          'action': 'close_rollback_reopen',
+          'error': error.toString(),
+        });
+      });
+      _fallbackJournal = _database.storageRoot.then((root) =>
+          FallbackDeliveryJournal(Directory('${root.path}/fallback_delivery')));
+      _replyOutbox = _database.storageRoot
+          .then((root) => ReplyOutbox(Directory('${root.path}/reply_outbox')));
+      _cacheVideoClaims = _database.storageRoot.then((root) =>
+          CacheVideoClaims(Directory('${root.path}/cache_video_claims')));
+      _attachmentDownloads = _database.storageRoot.then((root) =>
+          AttachmentDownloadQueue(
+              Directory('${root.path}/attachment_download_jobs'),
+              enabled: () => mounted && _autoCaptureRunning,
+              poll: _completeAttachmentDownload,
+              failed: _attachmentDownloadFailed,
+              onError: (error, stack) => _diagnosticLog.record(
+                  'capture.attachment_job_error',
+                  fields: {'error': error.toString()}),
+              onIdle: (customer) {
+                if (mounted && _autoCaptureRunning) {
+                  _scheduleDraftGeneration(customer, newEvidence: true);
+                }
+              }));
+      _videoCaptureQueue = _database.storageRoot.then((root) =>
+          VideoCaptureQueue(Directory('${root.path}/video_capture_jobs'),
+              enabled: () => mounted && _autoCaptureRunning,
+              process: _completeVideoCaptureJob,
+              onIdle: (customer) {
+                if (mounted && _autoCaptureRunning) {
+                  _scheduleDraftGeneration(customer, newEvidence: true);
+                }
+              },
+              onError: (error, stack) => _diagnosticLog.record(
+                  'capture.video_job_retry',
+                  fields: {'error': error.toString()})));
       _diagnosticLog = DiagnosticLog(
           () async => Directory('${(await _database.storageRoot).path}/logs'));
       _errorState = AppErrorState(log: _diagnosticLog);
-      _adapter = MacOSCaptureAdapter(diagnosticLog: _diagnosticLog);
+      _adapter = MacOSCaptureAdapter(
+          diagnosticLog: _diagnosticLog,
+          trustedCustomerIds: _savedTrustedCustomerIds);
+      _uiScheduler = UiOperationScheduler(
+        beginNative: _adapter.beginUiOperation,
+        endNative: _adapter.endUiOperation,
+        cancelNative: _adapter.cancelUiOperation,
+        onDiagnostic: (event, fields) =>
+            _diagnosticLog.record(event, fields: fields),
+      );
       _diagnosticLog.record('app.started');
       _coordinator = CaptureCoordinator(_adapter, _database);
       _deliveryWorker = SerialDeliveryWorker<QueuedDelivery>(
         enabled: () => mounted && _autoCaptureRunning,
         next: _database.nextReadyDelivery,
-        deliver: (delivery) =>
-            _withJdUiOperation(() => _sendAutomaticallyUnlocked(delivery)),
+        deliver: (delivery) => _withJdUiOperation(
+            () => _sendAutomaticallyUnlocked(delivery),
+            customer: delivery.userId,
+            label: 'delivery.original',
+            priority: UiPriority.originalReply),
         failed: _handleDeliveryFailure,
         afterAttempt: _coordinator.refresh,
         onError: (error, stack) {
@@ -209,32 +280,11 @@ class _CaptureHomeState extends State<CaptureHome> {
     }
   }
 
-  bool _customerPrefersChinese(String text) =>
-      RegExp(r'[\u3400-\u9fff]').hasMatch(text);
-
-  String _briefTransferProblem(HumanReviewTicket ticket) {
-    final compact =
-        ticket.customerRequest.replaceAll(RegExp(r'\s+'), ' ').trim();
-    if (compact.isEmpty) return '';
-    return compact.length <= 80 ? compact : '${compact.substring(0, 80)}…';
-  }
-
-  String _transferAcknowledgement(HumanReviewTicket ticket) {
-    final problem = _briefTransferProblem(ticket);
-    if (_customerPrefersChinese(ticket.customerRequest)) {
-      return problem.isEmpty
-          ? '我已了解并记录您反馈的问题。现在正为您转接其他客服同事，请稍等。'
-          : '我已了解并记录您反馈的“$problem”问题。现在正为您转接其他客服同事，请稍等。';
-    }
-    return problem.isEmpty
-        ? 'I understand your concern and have noted the details. I’m transferring this conversation to another customer service colleague now. Please wait a moment.'
-        : 'I understand your concern about “$problem” and have noted the details. I’m transferring this conversation to another customer service colleague now. Please wait a moment.';
-  }
+  String _transferAcknowledgement(HumanReviewTicket ticket) =>
+      safeTransferAcknowledgement();
 
   String _allAgentsBusyMessage(HumanReviewTicket ticket) =>
-      _customerPrefersChinese(ticket.customerRequest)
-          ? '目前其他客服同事都在忙，暂时无法转接。我会继续在这里为您处理这个问题。'
-          : 'All our other customer service colleagues are busy right now, so I can’t transfer the conversation yet. I’ll continue helping you with your question here.';
+      '目前其他客服同事都在忙，暂时无法转接。我会继续在这里为您处理这个问题。';
 
   Future<void> _sendTransferStatusNotice({
     required String customer,
@@ -267,7 +317,8 @@ class _CaptureHomeState extends State<CaptureHome> {
     await _refreshTickets();
   }
 
-  Future<void> _autoTransferTicket(HumanReviewTicket ticket) async {
+  Future<void> _autoTransferTicket(HumanReviewTicket ticket,
+      {String? acknowledgement}) async {
     final customer = ticket.conversationId;
     if (!_transferringCustomers.add(customer)) return;
     ChatTransferLog? log;
@@ -324,7 +375,7 @@ class _CaptureHomeState extends State<CaptureHome> {
         transferStarted = true;
         await _sendTransferStatusNotice(
           customer: customer,
-          message: _transferAcknowledgement(ticket),
+          message: acknowledgement ?? _transferAcknowledgement(ticket),
           model: 'jd-transfer-acknowledgement-v1',
         );
         preview = await _adapter
@@ -458,6 +509,7 @@ class _CaptureHomeState extends State<CaptureHome> {
         timer.cancel();
       }
       setState(() => _autoCaptureRunning = false);
+      await _uiScheduler.cancelAll();
       return;
     }
     setState(() {
@@ -467,6 +519,14 @@ class _CaptureHomeState extends State<CaptureHome> {
     });
     try {
       final status = await _adapter.status();
+      if (status['uiWorkerAvailable'] == false ||
+          status['uiWorkerTrusted'] == false ||
+          status['uiWorkerScreenRecording'] == false) {
+        throw PlatformException(
+            code: 'ui_worker_permission_unavailable',
+            message:
+                'The isolated UI worker is not ready or lacks Accessibility/Screen Recording access. No automation was started. Check macOS permissions for this exact Review app.');
+      }
       if ((status['competingApps'] as List? ?? const []).isNotEmpty) {
         throw PlatformException(
             code: 'another_automation_app_running',
@@ -524,6 +584,10 @@ class _CaptureHomeState extends State<CaptureHome> {
   }
 
   Future<void> _recoverAutomationQueues() async {
+    await (await _videoCaptureQueue).resume();
+    await (await _attachmentDownloads).resume();
+    await _database.repairPendingCaptures();
+    await _recoverOriginalReplyOutbox();
     final pending = await _database.conversations();
     for (final conversation in pending) {
       _scheduleDraftGeneration(conversation.userId, newEvidence: true);
@@ -538,7 +602,11 @@ class _CaptureHomeState extends State<CaptureHome> {
     if (!_autoCaptureRunning || _deliveryRecoveryBusy) return;
     _deliveryRecoveryBusy = true;
     try {
+      await (await _videoCaptureQueue).resume();
+      await (await _attachmentDownloads).resume();
       _requestDelivery();
+      await _recoverOriginalReplyOutbox();
+      await _database.repairPendingCaptures();
       final pending = await _database.conversations();
       for (final conversation in pending) {
         if (!_autoCaptureRunning) return;
@@ -555,7 +623,7 @@ class _CaptureHomeState extends State<CaptureHome> {
     }
   }
 
-  static const _uncapturedHoldingReply = '请稍等，我正在核对您刚发来的消息。';
+  static const _uncapturedHoldingReply = '已收到您刚发来的消息，我正在仔细核对，请稍候。';
   static const _uncapturedResendReply =
       '抱歉，我这边暂时没能看清您刚才发送的内容。方便您再描述一下遇到的问题，或重新发送图片、视频吗？我会继续帮您查看。';
 
@@ -588,9 +656,13 @@ class _CaptureHomeState extends State<CaptureHome> {
   }
 
   Future<void> _beginUnreadRecovery(String customer, int evidence,
-      {DateTime? detectedAt}) async {
-    if (_unreadRecovery.containsKey(customer) ||
-        !_startingUnreadRecovery.add(customer)) {
+      {DateTime? detectedAt, bool sidebarUnreadVerified = false}) async {
+    final existing = _unreadRecovery[customer];
+    if (existing != null) {
+      if (sidebarUnreadVerified) existing.verifySidebarUnread();
+      return;
+    }
+    if (!_startingUnreadRecovery.add(customer)) {
       return;
     }
     try {
@@ -614,6 +686,7 @@ class _CaptureHomeState extends State<CaptureHome> {
                 (messageAt(message)?.isBefore(eventAt) ?? false))
             .map((message) => message['id']?.toString() ?? '')
             .toSet(),
+        sidebarUnreadVerified: sidebarUnreadVerified,
       );
       _unreadRecovery[customer] = recovery;
       _armUnreadRecoveryTimers(recovery);
@@ -626,6 +699,21 @@ class _CaptureHomeState extends State<CaptureHome> {
     return UnreadCaptureRecovery.detectedFromBadge(
         DateTime.now(), row.unreadAgeSeconds);
   }
+
+  /// Track a real clear-to-unread transition independently of OCR. Existing
+  /// unread rows seen at application startup are deliberately not considered
+  /// new: that is what previously reopened inactive customers indefinitely.
+  void _observeSidebarUnread(QianniuConversationRow row) {
+    _sidebarUnreadTracker.observe(
+      customer: row.customer,
+      unread: row.unread,
+      observedAt: DateTime.now(),
+      unreadAgeSeconds: row.unreadAgeSeconds,
+    );
+  }
+
+  bool _hasVerifiedSidebarUnread(QianniuConversationRow row) =>
+      _sidebarUnreadTracker.isVerified(row.customer);
 
   void _refreshHandledUnread(QianniuConversationRow row) {
     final handledAt = _handledUnreadAt[row.customer];
@@ -654,7 +742,7 @@ class _CaptureHomeState extends State<CaptureHome> {
     }
   }
 
-  Future<Set<String>> _currentTrustedCustomerIds() async {
+  Future<Set<String>> _savedTrustedCustomerIds() async {
     final now = DateTime.now();
     if (_trustedCustomerIdsLoadedAt == null ||
         now.difference(_trustedCustomerIdsLoadedAt!) >=
@@ -663,7 +751,12 @@ class _CaptureHomeState extends State<CaptureHome> {
           await (await _database.history).trustedCustomerIds();
       _trustedCustomerIdsLoadedAt = now;
     }
-    final result = <String>{..._trustedCustomerIds};
+    return {..._trustedCustomerIds};
+  }
+
+  Future<Set<String>> _currentTrustedCustomerIds() async {
+    final now = DateTime.now();
+    final result = await _savedTrustedCustomerIds();
     final inspected = _ocrInspection;
     if (inspected != null &&
         now.difference(inspected.capturedAt).abs() <
@@ -760,9 +853,13 @@ class _CaptureHomeState extends State<CaptureHome> {
       final rows =
           await _reconciledConversationRows().timeout(_unreadOperationTimeout);
       for (final row in rows) {
+        _observeSidebarUnread(row);
         _refreshHandledUnread(row);
         if (!row.unread) {
           continue;
+        }
+        if (_hasVerifiedSidebarUnread(row)) {
+          _unreadRecovery[row.customer]?.verifySidebarUnread();
         }
         if (row.identityNeedsAxVerification ||
             _unreadRecovery.containsKey(row.customer) ||
@@ -771,7 +868,8 @@ class _CaptureHomeState extends State<CaptureHome> {
           continue;
         }
         await _beginUnreadRecovery(row.customer, row.unreadEvidence,
-            detectedAt: _unreadDetectedAt(row));
+            detectedAt: _unreadDetectedAt(row),
+            sidebarUnreadVerified: _hasVerifiedSidebarUnread(row));
       }
     } catch (_) {
       // The capture cycle continues to inspect the active chat even if a
@@ -817,7 +915,8 @@ class _CaptureHomeState extends State<CaptureHome> {
       final extraction = const OcrCaptureExtractor().analyze(inspection);
       final senderKey = extraction.latestIncomingSenderKey;
       final incomingAt = extraction.latestIncomingSentAt;
-      if (!extraction.latestVisibleSenderIsIncoming ||
+      if ((!extraction.latestVisibleSenderIsIncoming &&
+              !await _hasUncapturedRecentVisibleMedia(inspection, customer)) ||
           senderKey == null ||
           incomingAt == null ||
           incomingAt.isBefore(
@@ -831,26 +930,27 @@ class _CaptureHomeState extends State<CaptureHome> {
         await _beginUnreadRecovery(customer, 0, detectedAt: incomingAt);
       }
       final recovery = _unreadRecovery[customer];
-      recovery?.verifyIncomingSignal(
-        senderKey: senderKey,
-        sentAt: incomingAt,
-        capturedAt: inspection.capturedAt,
-      );
-      final capture =
-          const OcrCaptureExtractor().verifiedFastTextCapture(inspection);
+      if (recovery != null) {
+        _observeRecoverySignal(recovery, extraction, inspection);
+      }
+      // Fast text cannot promote thumbnail OCR when Vision temporarily loses
+      // the full media rectangle. The full, sender-masked capture owns it.
+      final capture = _ocrMediaMasks.regions(inspection, customer).isEmpty
+          ? const OcrCaptureExtractor().verifiedFastTextCapture(inspection)
+          : null;
       if (capture != null) {
         final inserted = await _database.saveCapture(capture);
         if (inserted > 0) {
           if (recovery != null) {
             await _database.capSlaFallbackDue(
                 userId: customer,
-                dueAt: recovery.detectedAt
-                    .add(UnreadCaptureRecovery.holdingAfter));
+                dueAt:
+                    recovery.eventAt.add(UnreadCaptureRecovery.holdingAfter));
             if (recovery.holdingSentAt case final sentAt?) {
               await _database.acknowledgeUncapturedHolding(
                   userId: customer, sentAt: sentAt);
             }
-            _finishUnreadRecovery(customer);
+            _finishUnreadRecovery(customer, expectedRecovery: recovery);
           }
           _scheduleDraftGeneration(customer, newEvidence: true);
           await _coordinator.refresh();
@@ -950,15 +1050,39 @@ class _CaptureHomeState extends State<CaptureHome> {
     _unreadResendTimers.remove(customer)?.cancel();
     final now = DateTime.now();
     if (!recovery.holdingSent) {
-      final due = recovery.detectedAt.add(UnreadCaptureRecovery.holdingAfter);
+      final due = recovery.eventAt.add(UnreadCaptureRecovery.holdingAfter);
       _unreadHoldingTimers[customer] = Timer(
         due.isAfter(now) ? due.difference(now) : Duration.zero,
         () => unawaited(_sendUnreadRecoveryNotice(recovery, resend: false)),
       );
+    } else {
+      _armUnreadResendTimer(recovery);
     }
   }
 
-  void _finishUnreadRecovery(String customer, {DateTime? handledAt}) {
+  void _armUnreadResendTimer(UnreadCaptureRecovery recovery) {
+    final customer = recovery.customer;
+    _unreadResendTimers.remove(customer)?.cancel();
+    if (!recovery.holdingSent ||
+        recovery.holdingSentAt == null ||
+        !recovery.hasVerifiedIncomingSignal ||
+        recovery.resendSent) {
+      return;
+    }
+    final now = DateTime.now();
+    final due = recovery.resendDueAt;
+    _unreadResendTimers[customer] = Timer(
+      due.isAfter(now) ? due.difference(now) : Duration.zero,
+      () => unawaited(_sendUnreadRecoveryNotice(recovery, resend: true)),
+    );
+  }
+
+  void _finishUnreadRecovery(String customer,
+      {DateTime? handledAt, UnreadCaptureRecovery? expectedRecovery}) {
+    if (expectedRecovery != null &&
+        !identical(_unreadRecovery[customer], expectedRecovery)) {
+      return;
+    }
     final recovery = _unreadRecovery.remove(customer);
     _unreadHoldingTimers.remove(customer)?.cancel();
     _unreadResendTimers.remove(customer)?.cancel();
@@ -973,11 +1097,13 @@ class _CaptureHomeState extends State<CaptureHome> {
     }
   }
 
-  void _discardUnreadRecovery(String customer) {
-    _unreadRecovery.remove(customer);
-    _unreadHoldingTimers.remove(customer)?.cancel();
-    _unreadResendTimers.remove(customer)?.cancel();
-    _processingUnreadEvidence.remove(customer);
+  Future<bool> _hasUncapturedRecentVisibleMedia(
+      OcrInspection inspection, String customer) async {
+    final document = await (await _database.history).read(customer);
+    final messages = (document?['messages'] as List<Object?>? ?? const [])
+        .whereType<Map<String, dynamic>>();
+    return const OcrImageCandidateSelector()
+        .hasUncapturedRecentCustomerMedia(inspection, customer, messages);
   }
 
   Future<bool> _hasRecoveredIncoming(UnreadCaptureRecovery recovery) async {
@@ -1000,15 +1126,25 @@ class _CaptureHomeState extends State<CaptureHome> {
   Future<DateTime?> _newOutgoingAt(UnreadCaptureRecovery recovery) async {
     final document = await (await _database.history).read(recovery.customer);
     final messages = (document?['messages'] as List<Object?>? ?? const [])
-        .whereType<Map<String, dynamic>>();
+        .whereType<Map<String, dynamic>>()
+        .toList(growable: false);
     DateTime? newest;
     for (final message in messages) {
-      if (message['direction'] != 'outgoing' ||
-          message['source'] == 'sla_fallback' ||
-          message['delivery_status'] == 'delivery_unknown' ||
+      if (!isConfirmedOutgoingReply(message) ||
           recovery.knownOutgoingIds.contains(message['id']?.toString() ?? '') ||
           message['body'] == _uncapturedHoldingReply ||
           message['body'] == _uncapturedResendReply) {
+        continue;
+      }
+      if (isGeneratedReply(message) &&
+          !recovery.acceptsGeneratedReply(message, messages,
+              pendingMedia: _mediaAcquisitions
+                  .forCustomer(recovery.customer)
+                  .any((event) =>
+                      !event.acquired &&
+                      !event.sentAt.isBefore(recovery.detectedAt.subtract(
+                          UnreadCaptureRecovery
+                              .detectedTurnClockTolerance))))) {
         continue;
       }
       final sentAt = DateTime.tryParse(message['sent_at']?.toString() ?? '') ??
@@ -1027,6 +1163,69 @@ class _CaptureHomeState extends State<CaptureHome> {
     return recovery.holdingReplySentAt(messages);
   }
 
+  void _observeRecoverySignal(UnreadCaptureRecovery recovery,
+      OcrExtractionAttempt extraction, OcrInspection inspection) {
+    final revision = recovery.noticeRevision;
+    final hadClock = recovery.hasVerifiedIncomingSignal;
+    recovery.verifyIncomingSignal(
+        senderKey: extraction.latestIncomingSenderKey,
+        sentAt: extraction.latestIncomingSentAt,
+        capturedAt: inspection.capturedAt);
+    if (recovery.noticeRevision != revision ||
+        (!hadClock && recovery.hasVerifiedIncomingSignal)) {
+      _diagnosticLog.record('unread_recovery.new_event', fields: {
+        'customer': recovery.customer,
+        'event_at': recovery.eventAt.toUtc().toIso8601String(),
+        'previous_notice_cancelled': true,
+      });
+      _armUnreadRecoveryTimers(recovery);
+    }
+  }
+
+  /// Only acquired, customer-verified media evidence may hide thumbnail OCR.
+  Future<MediaAcquisition> _recordVerifiedUpload(OcrInspection inspection,
+      String customer, OcrVisualRegion region, DateTime at, int slot) async {
+    final event = _mediaAcquisitions.observe(
+        customer, uploadEventKey(at, slot), at, inspection.capturedAt)
+      ..acquired = true;
+    _ocrMediaMasks.remember(inspection, customer, region);
+    await (await _database.history)
+        .recordMediaAcquisition(customer, event.toJson());
+    return event;
+  }
+
+  /// A queued old timer cannot send before checking the current sender clock.
+  /// In particular, a badge-only recovery never authorizes a resend request.
+  Future<OcrInspection?> _preflightRecoveryNotice(
+      UnreadCaptureRecovery recovery) async {
+    try {
+      await _adapter
+          .openConversation(recovery.customer, allowActivation: true)
+          .timeout(const Duration(seconds: 8));
+      final windows =
+          await _adapter.listOcrWindows().timeout(_fallbackInspectionTimeout);
+      if (windows.isEmpty) return null;
+      final window = windows.firstWhere((w) => w.title.contains('咚咚融合工作台'),
+          orElse: () => windows.first);
+      final inspection = await _adapter
+          .inspectExpectedCustomer(
+              windowId: window.windowId,
+              expectedCustomer: recovery.customer,
+              fast: true)
+          .timeout(_fallbackInspectionTimeout);
+      if (!identical(_unreadRecovery[recovery.customer], recovery)) return null;
+      final extraction = _analyzeUnreadInspection(inspection, recovery);
+      _observeRecoverySignal(recovery, extraction, inspection);
+      // A notice preflight is read-only. Rectangles alone are not uploads and
+      // must not create collection waits or mask a real text message.
+      return inspection;
+    } on PlatformException {
+      return null;
+    } on TimeoutException {
+      return null;
+    }
+  }
+
   Future<void> _sendUnreadRecoveryNotice(UnreadCaptureRecovery recovery,
       {required bool resend}) async {
     if (!_autoCaptureRunning ||
@@ -1034,23 +1233,32 @@ class _CaptureHomeState extends State<CaptureHome> {
         recovery.noticeSending) {
       return;
     }
+    final noticeRevision = recovery.noticeRevision;
     recovery.noticeSending = true;
     try {
       await _withFallbackPriority(() async {
-        if (!identical(_unreadRecovery[recovery.customer], recovery)) return;
+        if (!_autoCaptureRunning ||
+            !identical(_unreadRecovery[recovery.customer], recovery)) {
+          return;
+        }
+        if (noticeRevision != recovery.noticeRevision) return;
         if (await _database.isHumanContacting(recovery.customer)) {
           _finishUnreadRecovery(recovery.customer);
           return;
         }
+        final preflight = await _preflightRecoveryNotice(recovery);
         if (await _newOutgoingAt(recovery) case final sentAt?) {
           _finishUnreadRecovery(recovery.customer, handledAt: sentAt);
           return;
         }
-        if (await _holdingSentSinceRecovery(recovery) case final sentAt?) {
-          recovery.holdingSent = true;
-          recovery.holdingSentAt = sentAt;
-          _finishUnreadRecovery(recovery.customer, handledAt: sentAt);
-          return;
+        if (!recovery.holdingSent) {
+          final sentAt = await _holdingSentSinceRecovery(recovery);
+          if (sentAt != null) {
+            recovery.holdingSent = true;
+            recovery.holdingSentAt = sentAt;
+            _armUnreadResendTimer(recovery);
+            if (!resend) return;
+          }
         }
         if (await _hasRecoveredIncoming(recovery)) {
           if (recovery.holdingSentAt case final sentAt?) {
@@ -1062,64 +1270,81 @@ class _CaptureHomeState extends State<CaptureHome> {
           _scheduleDraftGeneration(recovery.customer, newEvidence: false);
           return;
         }
-        if (await _database.hasActiveSlaFallback(recovery.customer)) {
-          // OCR already captured this turn. Its durable SLA row owns the only
-          // holding message and draft generation; never race a second send.
-          _finishUnreadRecovery(recovery.customer);
-          unawaited(_scheduleSlaFallback(recovery.customer));
-          _scheduleDraftGeneration(recovery.customer, newEvidence: false);
-          return;
-        }
+        // A durable SLA row can belong to an older, still-generating batch.
+        // Only _hasRecoveredIncoming above proves this recovery was captured.
         final now = DateTime.now();
+        final freshSender = preflight == null
+            ? null
+            : _analyzeUnreadInspection(preflight, recovery)
+                .latestIncomingSentAt;
+        if (resend &&
+            (freshSender == null ||
+                freshSender != recovery.latestIncomingSentAt)) {
+          recovery.requestImmediateCaptureRetry();
+          _retryUnreadRecoveryNotice(recovery,
+              resend: true, delay: const Duration(seconds: 5));
+          return;
+        }
         if (resend ? !recovery.resendDue(now) : !recovery.holdingDue(now)) {
+          _armUnreadRecoveryTimers(recovery);
           return;
         }
-        if (recovery.videoProcessing) {
-          // A verified video is already being copied and decoded. Let that
-          // operation persist the message and cancel recovery; send a holding
-          // message only if media processing actually exits without evidence.
-          _retryUnreadRecoveryNotice(recovery, resend: resend);
-          return;
-        }
-        if (!recovery.hasVerifiedIncomingSignal) {
+        // Video decoding runs outside the UI queue and never suppresses a
+        // customer's holding/resend deadline, including on decoder failure.
+        if (!recovery.canSendHoldingAt(now)) {
           _diagnosticLog.record('unread_recovery.notice_suppressed', fields: {
             'customer': recovery.customer,
             'reason': 'sidebar_badge_without_fresh_incoming_sender_clock',
-            'action': 'capture_requeued',
+            'action': 'capture_retry_scheduled',
           });
           // The customer may simply be waiting in an unselected row. Do not
           // mark that unread badge as handled: doing so suppresses every later
           // row switch until JD happens to clear/reset the badge. Keep the
-          // recovery and explicitly queue a full, exact-customer capture.
-          recovery.requestImmediateCaptureRetry();
-          unawaited(_runAutoCaptureCycle());
+          // recovery and let the bounded capture cadence retry. Re-arming the
+          // notice is essential: a later successful sender-clock scan must
+          // still produce the holding message instead of being silently lost.
+          _retryUnreadRecoveryNotice(recovery,
+              resend: resend, delay: const Duration(seconds: 5));
           return;
         }
-        await _adapter
-            .openConversation(recovery.customer, allowActivation: true)
-            .timeout(const Duration(seconds: 8));
         // This is only a bounded check for a colleague's visible reply. The
         // capture loop owns text/media extraction; OCR failure must not block
         // the 20-second notice. sendDraftOnce verifies the customer again.
         try {
-          final windows = await _adapter
-              .listOcrWindows()
-              .timeout(_fallbackInspectionTimeout);
-          if (windows.isNotEmpty) {
-            final reception = windows.firstWhere(
-                (window) => window.title.contains('咚咚融合工作台'),
-                orElse: () => windows.first);
-            final inspection = await _adapter
-                .inspectExpectedCustomer(
-                  windowId: reception.windowId,
-                  expectedCustomer: recovery.customer,
-                )
-                .timeout(_fallbackInspectionTimeout);
+          final windows = preflight != null
+              ? const <OcrWindowInfo>[]
+              : await _adapter
+                  .listOcrWindows()
+                  .timeout(_fallbackInspectionTimeout);
+          if (preflight != null || windows.isNotEmpty) {
+            final reception = windows.isEmpty
+                ? null
+                : windows.firstWhere(
+                    (window) => window.title.contains('咚咚融合工作台'),
+                    orElse: () => windows.first);
+            final inspection = preflight ??
+                await _adapter
+                    .inspectExpectedCustomer(
+                      windowId: reception!.windowId,
+                      expectedCustomer: recovery.customer,
+                    )
+                    .timeout(_fallbackInspectionTimeout);
+            _observeRecoverySignal(recovery,
+                _analyzeUnreadInspection(inspection, recovery), inspection);
             final visible =
                 const OcrCaptureExtractor().analyze(inspection).capture;
+            final history =
+                await (await _database.history).read(recovery.customer);
+            final knownMessages =
+                (history?['messages'] as List<Object?>? ?? const [])
+                    .whereType<Map<String, dynamic>>();
             final colleagueReply = visible?.messages.reversed
                 .where((message) =>
                     message.direction == 'outgoing' &&
+                    !isObservedGeneratedReply(
+                        body: message.body,
+                        sentAt: message.sentAt,
+                        messages: knownMessages) &&
                     !recovery.knownOutgoingIds.contains(message.stableId) &&
                     !_isOwnHoldingReply(message.body) &&
                     message.body != _uncapturedResendReply &&
@@ -1145,11 +1370,14 @@ class _CaptureHomeState extends State<CaptureHome> {
           _finishUnreadRecovery(recovery.customer, handledAt: sentAt);
           return;
         }
-        if (await _holdingSentSinceRecovery(recovery) case final sentAt?) {
-          recovery.holdingSent = true;
-          recovery.holdingSentAt = sentAt;
-          _finishUnreadRecovery(recovery.customer, handledAt: sentAt);
-          return;
+        if (!recovery.holdingSent) {
+          final sentAt = await _holdingSentSinceRecovery(recovery);
+          if (sentAt != null) {
+            recovery.holdingSent = true;
+            recovery.holdingSentAt = sentAt;
+            _armUnreadResendTimer(recovery);
+            if (!resend) return;
+          }
         }
         if (await _hasRecoveredIncoming(recovery)) {
           if (recovery.holdingSentAt case final sentAt?) {
@@ -1161,25 +1389,63 @@ class _CaptureHomeState extends State<CaptureHome> {
           _scheduleDraftGeneration(recovery.customer, newEvidence: false);
           return;
         }
-        final reply = resend ? _uncapturedResendReply : _uncapturedHoldingReply;
-        await _adapter.sendDraftOnce(
-          expectedCustomer: recovery.customer,
-          reply: reply,
-          mediaPaths: const [],
-        );
+        if (resend
+            ? !recovery.resendDue(DateTime.now())
+            : !recovery.holdingDue(DateTime.now())) {
+          _armUnreadRecoveryTimers(recovery);
+          return;
+        }
+        final uploadReceipt = uploadHoldingReceipt(
+            _mediaAcquisitions.forCustomer(recovery.customer),
+            recovery.latestIncomingSentAt);
+        final receiptKey = uploadReceipt == null
+            ? null
+            : (resend ? '$uploadReceipt:readability' : uploadReceipt);
+        final reply = resend && uploadReceipt != null
+            ? '我已收到您发送的附件，但目前还没能读取完整内容。您希望我重点查看哪一处？我会继续帮您核对。'
+            : resend
+                ? _uncapturedResendReply
+                : _uncapturedHoldingReply;
+        final journalKey = receiptKey ??
+            'unread-recovery:${recovery.eventAt.microsecondsSinceEpoch}:${resend ? 'resend' : 'holding'}';
+        final journal = await _fallbackJournal;
+        if (!_autoCaptureRunning) return;
+        if (!await journal.reserve(recovery.customer, journalKey)) {
+          if (resend) {
+            recovery.resendSent = true;
+          } else {
+            recovery.holdingSent = true;
+            recovery.holdingSentAt ??= DateTime.now();
+            _armUnreadResendTimer(recovery);
+          }
+          return;
+        }
+        try {
+          await _adapter.sendDraftOnce(
+              expectedCustomer: recovery.customer,
+              reply: reply,
+              mediaPaths: const []);
+        } on PlatformException catch (error) {
+          if (_definitelyBeforeSend(error)) {
+            await journal.releaseBeforeSend(recovery.customer, journalKey);
+          }
+          rethrow;
+        }
         final sentAt = DateTime.now();
         if (resend) {
           recovery.resendSent = true;
         } else {
           recovery.holdingSent = true;
           recovery.holdingSentAt = sentAt;
+          _armUnreadResendTimer(recovery);
         }
         try {
           await (await _database.history).appendSlaFallbackSent(
             userId: recovery.customer,
             messageId:
-                'unread-recovery:${recovery.detectedAt.microsecondsSinceEpoch}:${resend ? 'resend' : 'holding'}',
+                'unread-recovery:${recovery.eventAt.microsecondsSinceEpoch}:${resend ? 'resend' : 'holding'}',
             reply: reply,
+            receiptKey: receiptKey,
           );
           if (!resend) {
             await _database.acknowledgeUncapturedHolding(
@@ -1196,11 +1462,17 @@ class _CaptureHomeState extends State<CaptureHome> {
               ? 'Asked ${recovery.customer} to resend content that could not be captured.'
               : 'Sent a holding message to ${recovery.customer} while capture retries continue.');
         }
+        if (resend) {
+          _finishUnreadRecovery(recovery.customer, handledAt: sentAt);
+        }
       });
     } on PlatformException catch (error) {
       if (_isIdentityOpenFailure(error.code)) {
-        _quarantineIdentity(recovery.customer, error.code);
-        _discardUnreadRecovery(recovery.customer);
+        // Recovery already belongs to a verified customer. A missing row or
+        // transient menu/layout change is not evidence that their ID is bad.
+        // Preserve both deadlines and retry without blocking other customers.
+        _retryUnreadRecoveryNotice(recovery,
+            resend: resend, delay: const Duration(seconds: 5));
       } else {
         // A notice that was not confirmed returns to its retry timer instead
         // of resolving this recovery without a customer-visible send.
@@ -1208,20 +1480,112 @@ class _CaptureHomeState extends State<CaptureHome> {
       }
       if (mounted) setState(() => _error = error);
     } catch (error) {
+      if (ResilientDatabase.isContention(error)) {
+        try {
+          final job = await _fallbackJobFromHistory(recovery.customer);
+          if (job != null && await _hasRecoveredIncoming(recovery)) {
+            await _sendFallbackDuringDatabaseContention(job);
+          } else {
+            await _sendUncapturedNoticeWithoutDatabase(recovery,
+                resend: resend);
+          }
+        } catch (noticeError) {
+          _diagnosticLog.record('unread_recovery.storage_retry', fields: {
+            'customer': recovery.customer,
+            'error': noticeError.toString(),
+          });
+        }
+      }
       _retryUnreadRecoveryNotice(recovery, resend: resend);
       if (mounted) setState(() => _error = error);
     } finally {
       recovery.noticeSending = false;
+      if (noticeRevision != recovery.noticeRevision &&
+          identical(_unreadRecovery[recovery.customer], recovery)) {
+        _armUnreadRecoveryTimers(recovery);
+      }
     }
   }
 
+  Future<void> _sendUncapturedNoticeWithoutDatabase(
+      UnreadCaptureRecovery recovery,
+      {required bool resend}) async {
+    if (!_autoCaptureRunning ||
+        !identical(_unreadRecovery[recovery.customer], recovery) ||
+        _transferringCustomers.contains(recovery.customer) ||
+        !recovery.canSendHoldingAt(DateTime.now())) {
+      return;
+    }
+    await _withFallbackPriority(() async {
+      if (!_autoCaptureRunning ||
+          !identical(_unreadRecovery[recovery.customer], recovery)) {
+        return;
+      }
+      final inspection = await _preflightRecoveryNotice(recovery);
+      final freshSender = inspection == null
+          ? null
+          : _analyzeUnreadInspection(inspection, recovery).latestIncomingSentAt;
+      if (resend &&
+          (freshSender == null ||
+              freshSender != recovery.latestIncomingSentAt)) {
+        return;
+      }
+      if (await _newOutgoingAt(recovery) != null) return;
+      if (resend
+          ? !recovery.resendDue(DateTime.now())
+          : !recovery.holdingDue(DateTime.now())) {
+        _armUnreadRecoveryTimers(recovery);
+        return;
+      }
+      if (!resend &&
+          (recovery.holdingSent ||
+              await _holdingSentSinceRecovery(recovery) != null)) {
+        return;
+      }
+      final journal = await _fallbackJournal;
+      final messageId =
+          'unread-recovery:${recovery.eventAt.microsecondsSinceEpoch}:${resend ? 'resend' : 'holding'}';
+      if (!_autoCaptureRunning) return;
+      if (!await journal.reserve(recovery.customer, messageId)) return;
+      final upload = uploadHoldingReceipt(
+          _mediaAcquisitions.forCustomer(recovery.customer),
+          recovery.latestIncomingSentAt);
+      final reply = resend && upload != null
+          ? '我已收到您发送的附件，但目前还没能读取完整内容。您希望我重点查看哪一处？我会继续帮您核对。'
+          : resend
+              ? _uncapturedResendReply
+              : _uncapturedHoldingReply;
+      try {
+        await _adapter.sendDraftOnce(
+            expectedCustomer: recovery.customer,
+            reply: reply,
+            mediaPaths: const []);
+      } on PlatformException catch (error) {
+        if (_definitelyBeforeSend(error)) {
+          await journal.releaseBeforeSend(recovery.customer, messageId);
+        }
+        rethrow;
+      }
+      await (await _database.history).appendSlaFallbackSent(
+          userId: recovery.customer, messageId: messageId, reply: reply);
+      if (resend) {
+        recovery.resendSent = true;
+        _finishUnreadRecovery(recovery.customer);
+      } else {
+        recovery.holdingSent = true;
+        recovery.holdingSentAt = DateTime.now();
+        _armUnreadResendTimer(recovery);
+      }
+    });
+  }
+
   void _retryUnreadRecoveryNotice(UnreadCaptureRecovery recovery,
-      {required bool resend}) {
+      {required bool resend, Duration delay = const Duration(seconds: 2)}) {
     if (!identical(_unreadRecovery[recovery.customer], recovery)) return;
     final timers = resend ? _unreadResendTimers : _unreadHoldingTimers;
     timers.remove(recovery.customer)?.cancel();
     timers[recovery.customer] = Timer(
-      const Duration(seconds: 2),
+      delay,
       () => unawaited(_sendUnreadRecoveryNotice(recovery, resend: resend)),
     );
   }
@@ -1248,6 +1612,35 @@ class _CaptureHomeState extends State<CaptureHome> {
   }
 
   Future<void> _queueDraftIfPending(String userId) async {
+    try {
+      await _queueDraftIfPendingChecked(userId);
+    } catch (error) {
+      _diagnosticLog.record('generation.queue_retry', fields: {
+        'customer': userId,
+        'error': error.toString(),
+      });
+      _scheduleDraftRetry(userId);
+      if (mounted) setState(() => _error = error);
+    }
+  }
+
+  Future<void> _queueDraftIfPendingChecked(String userId) async {
+    if (_mediaAcquisitions.deferGeneration(userId, DateTime.now())) {
+      _draftRetryTimers.remove(userId)?.cancel();
+      _draftRetryTimers[userId] = Timer(const Duration(seconds: 1), () {
+        _draftRetryTimers.remove(userId);
+        unawaited(_queueDraftIfPending(userId));
+      });
+      return;
+    }
+    final videos = await _videoCaptureQueue;
+    await videos.initialize();
+    // Only this customer's next generation waits for its owned media files.
+    // Other customers and already generated replies proceed independently.
+    if (videos.hasCustomer(userId)) return;
+    final attachments = await _attachmentDownloads;
+    await attachments.initialize();
+    if (attachments.hasCustomer(userId)) return;
     if (!await _database.hasPendingUnanswered(userId) ||
         await _database.isHumanContacting(userId)) {
       return;
@@ -1263,12 +1656,121 @@ class _CaptureHomeState extends State<CaptureHome> {
   }
 
   Future<void> _scheduleSlaFallback(String userId) async {
-    final job = await _database.slaFallbackJob(userId);
+    SlaFallbackJob? job;
+    try {
+      job = await _database.slaFallbackJob(userId);
+    } catch (error) {
+      if (!ResilientDatabase.isContention(error)) rethrow;
+      job = await _fallbackJobFromHistory(userId);
+    }
     if (job == null) {
       _slaFallbackTimers.remove(userId)?.cancel();
       return;
     }
     _armSlaFallback(job);
+  }
+
+  Future<SlaFallbackJob?> _fallbackJobFromHistory(String userId) async {
+    final document = await (await _database.history).read(userId);
+    final messages = (document?['messages'] as List<Object?>? ?? const [])
+        .whereType<Map<String, dynamic>>()
+        .toList(growable: false);
+    final incoming = messages
+        .where((message) => message['direction'] == 'incoming')
+        .lastOrNull;
+    final capturedAt =
+        DateTime.tryParse(incoming?['captured_at']?.toString() ?? '');
+    if (incoming == null ||
+        capturedAt == null ||
+        DateTime.now().difference(capturedAt) > const Duration(minutes: 10)) {
+      return null;
+    }
+    return SlaFallbackJob(
+        userId: userId,
+        messageId: incoming['id'].toString(),
+        dueAt: capturedAt.add(CaptureDatabase.slaFallbackDelay));
+  }
+
+  Future<bool> _sendHoldingWithJournal(SlaFallbackJob job, String reply) async {
+    final store = await _database.history;
+    final document = await store.read(job.userId);
+    final messages = (document?['messages'] as List<Object?>? ?? const [])
+        .whereType<Map<String, dynamic>>()
+        .toList(growable: false);
+    final incomingIndex = messages.indexWhere((message) =>
+        message['id'] == job.messageId && message['direction'] == 'incoming');
+    if (incomingIndex < 0 || await _hasReplySinceSlaMessage(job)) return false;
+    final lastFinal = messages.lastIndexWhere(isConfirmedOutgoingReply);
+    final lastHolding = messages
+        .lastIndexWhere((message) => message['source'] == 'sla_fallback');
+    if (lastHolding > lastFinal) {
+      final heldAt =
+          DateTime.tryParse(messages[lastHolding]['sent_at']?.toString() ?? '');
+      final incomingAt = DateTime.tryParse(
+          messages[incomingIndex]['sent_at']?.toString() ?? '');
+      if (heldAt == null || incomingAt == null || !incomingAt.isAfter(heldAt)) {
+        return false;
+      }
+      final remaining =
+          heldAt.add(const Duration(seconds: 50)).difference(DateTime.now());
+      if (!remaining.isNegative) {
+        await _database.releaseSlaFallback(
+            userId: job.userId,
+            messageId: job.messageId,
+            retryDelay: remaining);
+        unawaited(_scheduleSlaFallback(job.userId));
+        return false;
+      }
+    }
+    final receiptKey = uploadHoldingReceipt(
+        _mediaAcquisitions.forCustomer(job.userId),
+        DateTime.tryParse(
+            messages[incomingIndex]['sent_at']?.toString() ?? ''));
+    if (receiptKey != null &&
+        messages.any((m) => m['media_event_receipt'] == receiptKey)) {
+      return false;
+    }
+    final journal = await _fallbackJournal;
+    final journalKey = receiptKey ?? job.messageId;
+    if (!await journal.reserve(job.userId, journalKey)) return false;
+    try {
+      await _adapter.sendDraftOnce(
+          expectedCustomer: job.userId, reply: reply, mediaPaths: const []);
+    } on PlatformException catch (error) {
+      if (_definitelyBeforeSend(error)) {
+        await journal.releaseBeforeSend(job.userId, journalKey);
+      }
+      rethrow;
+    }
+    // Preserve a confirmed send before touching SQLite. An SQL failure must
+    // never lose this receipt and cause a second customer-visible holding.
+    await store.appendSlaFallbackSent(
+        userId: job.userId,
+        messageId: job.messageId,
+        reply: reply,
+        receiptKey: receiptKey);
+    return true;
+  }
+
+  Future<void> _sendFallbackDuringDatabaseContention(SlaFallbackJob job) async {
+    if (!_autoCaptureRunning || _transferringCustomers.contains(job.userId)) {
+      return;
+    }
+    await _withFallbackPriority(() async {
+      if (!_autoCaptureRunning || await _hasReplySinceSlaMessage(job)) return;
+      final freshJob = await _fallbackJobFromHistory(job.userId);
+      if (freshJob == null) return;
+      await _adapter
+          .openConversation(job.userId, allowActivation: true)
+          .timeout(const Duration(seconds: 8));
+      final sent = await _sendHoldingWithJournal(job, _uncapturedHoldingReply);
+      _diagnosticLog.record('fallback.independent_storage', fields: {
+        'customer': job.userId,
+        'sent': sent,
+        'original_reply_still_pending': true,
+      });
+    });
+    _scheduleDraftRetry(job.userId);
   }
 
   void _armSlaFallback(SlaFallbackJob job) {
@@ -1286,23 +1788,10 @@ class _CaptureHomeState extends State<CaptureHome> {
     final messages = (document?['messages'] as List<Object?>? ?? const [])
         .whereType<Map<String, dynamic>>()
         .toList(growable: false);
-    final incoming = messages
-        .where((message) =>
-            message['id'] == job.messageId &&
-            message['direction'] == 'incoming')
-        .firstOrNull;
-    final incomingAt =
-        DateTime.tryParse(incoming?['sent_at']?.toString() ?? '');
-    if (incomingAt == null) return false;
     return messages.any((message) {
-      if (message['direction'] != 'outgoing' ||
-          message['source'] == 'sla_fallback' ||
-          message['delivery_status'] == 'delivery_unknown' ||
-          _isOwnHoldingReply(message['body']?.toString())) {
-        return false;
-      }
-      final sentAt = DateTime.tryParse(message['sent_at']?.toString() ?? '');
-      return sentAt != null && !sentAt.isBefore(incomingAt);
+      return !_isOwnHoldingReply(message['body']?.toString()) &&
+          replyAnswersIncoming(
+              reply: message, incomingId: job.messageId, messages: messages);
     });
   }
 
@@ -1356,11 +1845,11 @@ class _CaptureHomeState extends State<CaptureHome> {
             );
             return;
           }
-          await _adapter.sendDraftOnce(
-            expectedCustomer: job.userId,
-            reply: holdingReply,
-            mediaPaths: const [],
-          );
+          if (!await _sendHoldingWithJournal(job, holdingReply)) {
+            await _database.completeSlaFallbackAfterReply(
+                userId: job.userId, messageId: job.messageId);
+            return;
+          }
           final recorded = await _database.markSlaFallbackSent(
             userId: job.userId,
             messageId: job.messageId,
@@ -1388,6 +1877,20 @@ class _CaptureHomeState extends State<CaptureHome> {
       });
       await _coordinator.refresh();
     } catch (error) {
+      if (ResilientDatabase.isContention(error)) {
+        try {
+          await _sendFallbackDuringDatabaseContention(job);
+        } catch (fallbackError) {
+          _diagnosticLog.record('fallback.independent_storage_failed', fields: {
+            'customer': job.userId,
+            'error': fallbackError.toString(),
+          });
+          if (_autoCaptureRunning) {
+            _slaFallbackTimers[job.userId] = Timer(const Duration(seconds: 2),
+                () => unawaited(_sendSlaFallback(job)));
+          }
+        }
+      }
       if (mounted) setState(() => _error = error);
     }
   }
@@ -1400,16 +1903,6 @@ class _CaptureHomeState extends State<CaptureHome> {
       return;
     }
     _autoCaptureBusy = true;
-    final previousUiOperation = _jdUiTail;
-    var releaseUiOperation = Completer<void>();
-    var captureCycleExited = false;
-    _jdUiTail = releaseUiOperation.future;
-    await previousUiOperation;
-    if (!_autoCaptureRunning || !mounted) {
-      releaseUiOperation.complete();
-      _autoCaptureBusy = false;
-      return;
-    }
     final scanStartedAt = DateTime.now();
     if (mounted) {
       setState(() {
@@ -1422,11 +1915,14 @@ class _CaptureHomeState extends State<CaptureHome> {
       // Baseline polling does not activate JD. A verified unread media bubble
       // may briefly bring it forward to inspect the video play overlay, then
       // restore the operator's previous frontmost application.
-      await _adapter
-          .ensureReceptionWindow(allowActivation: false)
-          .timeout(_captureOperationTimeout);
-      final rows =
-          await _reconciledConversationRows().timeout(_captureOperationTimeout);
+      final rows = await _withJdUiOperation(() async {
+        if (!_autoCaptureRunning || !mounted) return <QianniuConversationRow>[];
+        await _adapter.ensureReceptionWindow(allowActivation: false);
+        return _reconciledConversationRows().timeout(_unreadOperationTimeout);
+      },
+          label: 'capture.sidebar',
+          priority: UiPriority.capture,
+          timeout: const Duration(seconds: 18));
       if (rows.isEmpty) {
         if (mounted) {
           setState(() => _diagnostics =
@@ -1435,6 +1931,7 @@ class _CaptureHomeState extends State<CaptureHome> {
         return;
       }
       for (final row in rows) {
+        _observeSidebarUnread(row);
         _refreshHandledUnread(row);
       }
       final evidenceAvailable = rows.any((row) => row.evidenceAvailable);
@@ -1443,151 +1940,147 @@ class _CaptureHomeState extends State<CaptureHome> {
         _lastUnreadProbeAt.remove(row.customer);
       }
       for (final row in rows.where((row) => row.unread)) {
+        if (_hasVerifiedSidebarUnread(row)) {
+          _unreadRecovery[row.customer]?.verifySidebarUnread();
+        }
         if (!row.identityNeedsAxVerification &&
             !_unreadRecovery.containsKey(row.customer) &&
             !_handledUnreadEvidence.containsKey(row.customer) &&
             !await _database.isHumanContacting(row.customer)) {
           await _beginUnreadRecovery(row.customer, row.unreadEvidence,
-              detectedAt: _unreadDetectedAt(row));
+              detectedAt: _unreadDetectedAt(row),
+              sidebarUnreadVerified: _hasVerifiedSidebarUnread(row));
         }
       }
-      final orderedRows = rows
-          .where((row) =>
-              (_unreadRecovery[row.customer]?.captureRetryDue(DateTime.now()) ??
-                  false) ||
-              (evidenceAvailable &&
-                  row.unread &&
-                  !_processingUnreadEvidence.containsKey(row.customer) &&
-                  !_handledUnreadEvidence.containsKey(row.customer)) ||
-              (row.unread &&
-                  _unreadRecovery[row.customer] == null &&
-                  !_handledUnreadEvidence.containsKey(row.customer) &&
-                  (_lastUnreadProbeAt[row.customer] == null ||
-                      DateTime.now()
-                              .difference(_lastUnreadProbeAt[row.customer]!) >=
-                          const Duration(seconds: 8))))
-          .toList(growable: false);
+      final orderedRows = rows.where((row) {
+        if (_mediaAcquisitions.retryDue(row.customer, DateTime.now())) {
+          return true;
+        }
+        final recovery = _unreadRecovery[row.customer];
+        if (recovery != null) {
+          return recovery.captureRetryDue(DateTime.now());
+        }
+        return (evidenceAvailable &&
+                row.unread &&
+                !_processingUnreadEvidence.containsKey(row.customer) &&
+                !_handledUnreadEvidence.containsKey(row.customer)) ||
+            (row.unread &&
+                !_handledUnreadEvidence.containsKey(row.customer) &&
+                (_lastUnreadProbeAt[row.customer] == null ||
+                    DateTime.now()
+                            .difference(_lastUnreadProbeAt[row.customer]!) >=
+                        const Duration(seconds: 8)));
+      }).toList(growable: false);
       if (orderedRows.isEmpty) {
         var insertedFromActiveChat = 0;
-        final windows =
-            await _adapter.listOcrWindows().timeout(_captureOperationTimeout);
-        if (windows.isNotEmpty) {
-          final reception = windows.firstWhere(
-              (window) => window.title.contains('咚咚融合工作台'),
-              orElse: () => windows.first);
-          final inspection =
-              await _inspectStableConversation(reception.windowId);
-          if (mounted) setState(() => _ocrInspection = inspection);
-          // JD does not expose an unread flag for the active sidebar row.
-          // Poll the already-open chat independently; durable message IDs
-          // prevent duplicate saves while keeping the unread count truthful.
-          final activeCustomer = inspection.activeCustomerId?.trim();
-          if (activeCustomer != null &&
-              activeCustomer.isNotEmpty &&
-              rows.any((row) => row.customer == activeCustomer)) {
-            final activeRow =
-                rows.firstWhere((row) => row.customer == activeCustomer);
-            var recovery = _unreadRecovery[activeCustomer];
-            final extraction = _analyzeUnreadInspection(inspection, recovery);
-            final senderKey = extraction.latestIncomingSenderKey;
-            final incomingTime = extraction.latestIncomingSentAt;
-            final recentIncoming = incomingTime != null &&
-                !incomingTime.isBefore(inspection.capturedAt
-                    .subtract(const Duration(minutes: 10))) &&
-                !incomingTime.isAfter(
-                    inspection.capturedAt.add(const Duration(minutes: 1)));
-            if (recovery == null &&
-                (activeRow.unread || recentIncoming) &&
-                extraction.latestVisibleSenderIsIncoming &&
-                senderKey != null &&
-                _handledIncomingSenderKeys[activeCustomer] != senderKey &&
-                !await _database.isHumanContacting(activeCustomer)) {
-              await _beginUnreadRecovery(
-                  activeCustomer, activeRow.unreadEvidence,
-                  detectedAt: activeRow.unread
-                      ? _unreadDetectedAt(activeRow)
-                      : incomingTime);
-              recovery = _unreadRecovery[activeCustomer];
-            }
-            if (recovery != null) {
-              recovery.verifyIncomingSignal(
-                senderKey: senderKey,
-                sentAt: incomingTime,
-                capturedAt: inspection.capturedAt,
-              );
-            }
-            if (!extraction.transferNoticeVisible) {
-              _visibleTransferWelcomes.remove(activeCustomer);
-            }
-            if (!await _database.isHumanContacting(activeCustomer)) {
-              // The selected chat may never show a sidebar unread badge.
-              // Its sender clock can start recovery, and this same pass must
-              // inspect the media bubble instead of waiting for a row scan.
-              final capture = await _captureWithVisibleMedia(
-                inspection,
-                extraction,
-                // A media-only turn can have no OCR sender/body and JD may
-                // clear its unread badge as soon as this chat is opened.
-                // Let the bounded visual candidate check recover that turn.
-                allowUnlabeledLatestImage:
-                    recovery != null || extraction.capture == null,
-                allowRecoveryAfterHolding: recovery?.holdingSent == true,
-                allowVideoDetectionActivation: recovery != null,
-                runVideoProcessingUnlocked: (work) async {
-                  if (!releaseUiOperation.isCompleted) {
-                    releaseUiOperation.complete();
-                  }
-                  try {
-                    return await work();
-                  } finally {
-                    if (!captureCycleExited) {
-                      final queuedUiOperation = _jdUiTail;
-                      releaseUiOperation = Completer<void>();
-                      _jdUiTail = releaseUiOperation.future;
-                      await queuedUiOperation;
-                    }
-                  }
-                },
-              );
-              if (capture != null) {
-                insertedFromActiveChat = await _database.saveCapture(capture);
+        await _withJdUiOperation(() async {
+          if (!_autoCaptureRunning || !mounted) return;
+          final windows =
+              await _adapter.listOcrWindows().timeout(_captureOperationTimeout);
+          if (windows.isNotEmpty) {
+            final reception = windows.firstWhere(
+                (window) => window.title.contains('咚咚融合工作台'),
+                orElse: () => windows.first);
+            final inspection =
+                await _inspectStableConversation(reception.windowId);
+            if (mounted) setState(() => _ocrInspection = inspection);
+            // JD does not expose an unread flag for the active sidebar row.
+            // Poll the already-open chat independently; durable message IDs
+            // prevent duplicate saves while keeping the unread count truthful.
+            final activeCustomer = inspection.activeCustomerId?.trim();
+            if (activeCustomer != null &&
+                activeCustomer.isNotEmpty &&
+                rows.any((row) => row.customer == activeCustomer)) {
+              final activeRow =
+                  rows.firstWhere((row) => row.customer == activeCustomer);
+              var recovery = _unreadRecovery[activeCustomer];
+              final extraction = _analyzeUnreadInspection(inspection, recovery);
+              final senderKey = extraction.latestIncomingSenderKey;
+              final incomingTime = extraction.latestIncomingSentAt;
+              final recentIncoming = incomingTime != null &&
+                  !incomingTime.isBefore(inspection.capturedAt
+                      .subtract(const Duration(minutes: 10))) &&
+                  !incomingTime.isAfter(
+                      inspection.capturedAt.add(const Duration(minutes: 1)));
+              if (recovery == null &&
+                  (activeRow.unread || recentIncoming) &&
+                  (extraction.latestVisibleSenderIsIncoming ||
+                      await _hasUncapturedRecentVisibleMedia(
+                          inspection, activeCustomer)) &&
+                  senderKey != null &&
+                  _handledIncomingSenderKeys[activeCustomer] != senderKey &&
+                  !await _database.isHumanContacting(activeCustomer)) {
+                await _beginUnreadRecovery(
+                    activeCustomer, activeRow.unreadEvidence,
+                    detectedAt: activeRow.unread
+                        ? _unreadDetectedAt(activeRow)
+                        : incomingTime);
+                recovery = _unreadRecovery[activeCustomer];
               }
-              if (recovery != null &&
-                  insertedFromActiveChat > 0 &&
-                  capture != null &&
-                  capture.messages.any((message) =>
-                      message.direction == 'incoming' &&
-                      recovery!.acceptsIncoming(message.stableId,
-                          sentAt: message.sentAt,
-                          capturedAt: capture.capturedAt))) {
-                await _database.capSlaFallbackDue(
-                  userId: activeCustomer,
-                  dueAt: recovery.detectedAt
-                      .add(UnreadCaptureRecovery.holdingAfter),
+              if (recovery != null) {
+                _observeRecoverySignal(recovery, extraction, inspection);
+              }
+              if (!extraction.transferNoticeVisible) {
+                _visibleTransferWelcomes.remove(activeCustomer);
+              }
+              if (!await _database.isHumanContacting(activeCustomer)) {
+                // The selected chat may never show a sidebar unread badge.
+                // Its sender clock can start recovery, and this same pass must
+                // inspect the media bubble instead of waiting for a row scan.
+                final capture = await _captureWithVisibleMedia(
+                  inspection,
+                  extraction,
+                  // A media-only turn can have no OCR sender/body and JD may
+                  // clear its unread badge as soon as this chat is opened.
+                  // Let the bounded visual candidate check recover that turn.
+                  allowUnlabeledLatestImage:
+                      recovery != null || extraction.capture == null,
+                  allowRecoveryAfterHolding: recovery?.holdingSent == true,
                 );
-                if (recovery.holdingSentAt case final sentAt?) {
-                  await _database.acknowledgeUncapturedHolding(
-                      userId: activeCustomer, sentAt: sentAt);
-                  _slaFallbackTimers.remove(activeCustomer)?.cancel();
+                if (capture != null) {
+                  insertedFromActiveChat = await _database.saveCapture(capture);
                 }
-                _finishUnreadRecovery(activeCustomer);
+                if (recovery != null &&
+                    insertedFromActiveChat > 0 &&
+                    capture != null &&
+                    capture.messages.any((message) =>
+                        message.direction == 'incoming' &&
+                        recovery!.acceptsIncoming(message.stableId,
+                            sentAt: message.sentAt,
+                            capturedAt: capture.capturedAt))) {
+                  await _database.capSlaFallbackDue(
+                    userId: activeCustomer,
+                    dueAt: recovery.eventAt
+                        .add(UnreadCaptureRecovery.holdingAfter),
+                  );
+                  if (recovery.holdingSentAt case final sentAt?) {
+                    await _database.acknowledgeUncapturedHolding(
+                        userId: activeCustomer, sentAt: sentAt);
+                    _slaFallbackTimers.remove(activeCustomer)?.cancel();
+                  }
+                  _finishUnreadRecovery(activeCustomer,
+                      expectedRecovery: recovery);
+                }
+                await _database.ensurePendingForUnanswered(activeCustomer);
+                if (await _database.hasPendingUnanswered(activeCustomer)) {
+                  _scheduleDraftGeneration(activeCustomer,
+                      newEvidence: insertedFromActiveChat > 0);
+                }
+                if (insertedFromActiveChat > 0) await _coordinator.refresh();
               }
-              await _database.ensurePendingForUnanswered(activeCustomer);
-              if (await _database.hasPendingUnanswered(activeCustomer)) {
-                _scheduleDraftGeneration(activeCustomer,
-                    newEvidence: insertedFromActiveChat > 0);
+              if (extraction.transferNoticeVisible) {
+                await _handleTransferNotice(
+                  activeCustomer,
+                  extraction.transferNoticeKey ??
+                      'visible-transfer-${inspection.capturedAt.day}',
+                );
               }
-              if (insertedFromActiveChat > 0) await _coordinator.refresh();
-            }
-            if (extraction.transferNoticeVisible) {
-              await _handleTransferNotice(
-                activeCustomer,
-                extraction.transferNoticeKey ??
-                    'visible-transfer-${inspection.capturedAt.day}',
-              );
             }
           }
-        }
+        },
+            label: 'capture.active_customer',
+            priority: UiPriority.capture,
+            timeout: const Duration(seconds: 35));
         if (mounted) {
           setState(() => _diagnostics = evidenceAvailable
               ? insertedFromActiveChat > 0
@@ -1610,141 +2103,135 @@ class _CaptureHomeState extends State<CaptureHome> {
         if (!_autoCaptureRunning) break;
         var customer = row.customer;
         try {
-          if (row.identityNeedsAxVerification) {
-            final observed = row.observedCustomer ?? customer;
-            customer = await _adapter
-                .resolveConversationIdentityFromAx(observed,
-                    allowActivation: false)
+          await _withJdUiOperation(() async {
+            if (!_autoCaptureRunning || !mounted) return;
+            if (row.identityNeedsAxVerification) {
+              final observed = row.observedCustomer ?? customer;
+              customer = await _adapter
+                  .resolveConversationIdentityFromAx(observed,
+                      allowActivation: _hasVerifiedSidebarUnread(row))
+                  .timeout(_unreadOperationTimeout);
+              _trustedCustomerIds = {..._trustedCustomerIds, customer};
+              _diagnosticLog
+                  .record('conversation.identity_reconciled', fields: {
+                'observed_customer': observed,
+                'verified_customer': customer,
+                'basis': 'active_ax_header',
+              });
+            }
+            if (row.unread) _lastUnreadProbeAt[customer] = DateTime.now();
+            // Human takeover is scoped to one customer. Keep monitoring every
+            // other row while leaving this customer's Qianniu chat untouched.
+            if (await _database.isHumanContacting(customer)) return;
+            if (row.unread &&
+                !_unreadRecovery.containsKey(customer) &&
+                !_handledUnreadEvidence.containsKey(customer)) {
+              await _beginUnreadRecovery(customer, row.unreadEvidence,
+                  detectedAt: _unreadDetectedAt(row),
+                  sidebarUnreadVerified: _hasVerifiedSidebarUnread(row));
+            }
+            var recovery = _unreadRecovery[customer];
+            recovery?.recordCaptureAttempt(DateTime.now());
+            await _adapter
+                .openConversation(customer,
+                    allowActivation:
+                        recovery?.canSendHoldingAt(DateTime.now()) == true)
                 .timeout(_unreadOperationTimeout);
-            _trustedCustomerIds = {..._trustedCustomerIds, customer};
-            _diagnosticLog.record('conversation.identity_reconciled', fields: {
-              'observed_customer': observed,
-              'verified_customer': customer,
-              'basis': 'active_ax_header',
-            });
-          }
-          if (row.unread) _lastUnreadProbeAt[customer] = DateTime.now();
-          // Human takeover is scoped to one customer. Keep monitoring every
-          // other row while leaving this customer's Qianniu chat untouched.
-          if (await _database.isHumanContacting(customer)) continue;
-          if (row.unread &&
-              !_unreadRecovery.containsKey(customer) &&
-              !_handledUnreadEvidence.containsKey(customer)) {
-            await _beginUnreadRecovery(customer, row.unreadEvidence,
-                detectedAt: _unreadDetectedAt(row));
-          }
-          await _adapter
-              .openConversation(customer, allowActivation: false)
-              .timeout(_unreadOperationTimeout);
-          final inspection = await _adapter
-              .inspectExpectedCustomer(
-                windowId: reception.windowId,
-                expectedCustomer: customer,
-              )
-              .timeout(_unreadOperationTimeout);
-          if (mounted) setState(() => _ocrInspection = inspection);
-          var recovery = _unreadRecovery[customer];
-          final extraction = _analyzeUnreadInspection(inspection, recovery);
-          final senderKey = extraction.latestIncomingSenderKey;
-          final incomingAt = extraction.latestIncomingSentAt;
-          if (recovery == null &&
-              row.unread &&
-              extraction.latestVisibleSenderIsIncoming &&
-              senderKey != null &&
-              _handledIncomingSenderKeys[customer] != senderKey) {
-            await _beginUnreadRecovery(customer, row.unreadEvidence,
-                detectedAt: _unreadDetectedAt(row));
+            final inspection = await _adapter
+                .inspectExpectedCustomer(
+                  windowId: reception.windowId,
+                  expectedCustomer: customer,
+                )
+                .timeout(_unreadOperationTimeout);
+            if (mounted) setState(() => _ocrInspection = inspection);
             recovery = _unreadRecovery[customer];
-          }
-          if (recovery != null) {
-            recovery.verifyIncomingSignal(
-              senderKey: senderKey,
-              sentAt: incomingAt,
-              capturedAt: inspection.capturedAt,
-            );
-          }
-          if (recovery != null) {
-            recovery.lastCaptureAttemptAt = DateTime.now();
-          }
-          if (!extraction.transferNoticeVisible) {
-            _visibleTransferWelcomes.remove(customer);
-          }
-          final capture = await _captureWithVisibleMedia(inspection, extraction,
-              allowUnlabeledLatestImage: row.unread || recovery != null,
-              allowRecoveryAfterHolding: recovery?.holdingSent == true,
-              allowVideoDetectionActivation: recovery != null,
-              runVideoProcessingUnlocked: (work) async {
-            if (!releaseUiOperation.isCompleted) releaseUiOperation.complete();
-            try {
-              return await work();
-            } finally {
-              if (!captureCycleExited) {
-                final queuedUiOperation = _jdUiTail;
-                releaseUiOperation = Completer<void>();
-                _jdUiTail = releaseUiOperation.future;
-                await queuedUiOperation;
+            final extraction = _analyzeUnreadInspection(inspection, recovery);
+            final senderKey = extraction.latestIncomingSenderKey;
+            if (recovery == null &&
+                row.unread &&
+                (extraction.latestVisibleSenderIsIncoming ||
+                    await _hasUncapturedRecentVisibleMedia(
+                        inspection, customer)) &&
+                senderKey != null &&
+                _handledIncomingSenderKeys[customer] != senderKey) {
+              await _beginUnreadRecovery(customer, row.unreadEvidence,
+                  detectedAt: _unreadDetectedAt(row));
+              recovery = _unreadRecovery[customer];
+            }
+            if (recovery != null) {
+              _observeRecoverySignal(recovery, extraction, inspection);
+            }
+            if (!extraction.transferNoticeVisible) {
+              _visibleTransferWelcomes.remove(customer);
+            }
+            final capture = await _captureWithVisibleMedia(
+                    inspection, extraction,
+                    allowUnlabeledLatestImage: row.unread || recovery != null,
+                    allowRecoveryAfterHolding: recovery?.holdingSent == true)
+                .timeout(_captureOperationTimeout);
+            var insertedForCustomer = 0;
+            if (capture != null) {
+              insertedForCustomer = await _database.saveCapture(capture);
+              insertedTotal += insertedForCustomer;
+            }
+            final capturedNewIncoming = recovery != null &&
+                insertedForCustomer > 0 &&
+                (extraction.latestVisibleSenderIsIncoming ||
+                    extraction.capture == null ||
+                    (recovery.holdingSent &&
+                        _isOwnHoldingReply(
+                            extraction.capture?.messages.lastOrNull?.body)) ||
+                    (capture?.messages.any((message) =>
+                            message.direction == 'incoming' &&
+                            message.media.isNotEmpty) ==
+                        true)) &&
+                capture != null &&
+                capture.messages.any((message) =>
+                    message.direction == 'incoming' &&
+                    recovery!.acceptsIncoming(message.stableId,
+                        sentAt: message.sentAt,
+                        capturedAt: capture.capturedAt));
+            if (capturedNewIncoming) {
+              await _database.capSlaFallbackDue(
+                userId: customer,
+                dueAt: recovery.eventAt.add(UnreadCaptureRecovery.holdingAfter),
+              );
+              if (recovery.holdingSentAt case final sentAt?) {
+                await _database.acknowledgeUncapturedHolding(
+                    userId: customer, sentAt: sentAt);
+                _slaFallbackTimers.remove(customer)?.cancel();
               }
+              _finishUnreadRecovery(customer, expectedRecovery: recovery);
             }
-          }).timeout(_captureOperationTimeout);
-          var insertedForCustomer = 0;
-          if (capture != null) {
-            insertedForCustomer = await _database.saveCapture(capture);
-            insertedTotal += insertedForCustomer;
-          }
-          final capturedNewIncoming = recovery != null &&
-              insertedForCustomer > 0 &&
-              (extraction.latestVisibleSenderIsIncoming ||
-                  extraction.capture == null ||
-                  (recovery.holdingSent &&
-                      _isOwnHoldingReply(
-                          extraction.capture?.messages.lastOrNull?.body)) ||
-                  (recovery.holdingSent &&
-                      capture?.messages.any((message) =>
-                              message.direction == 'incoming' &&
-                              message.media.isNotEmpty) ==
-                          true)) &&
-              capture != null &&
-              capture.messages.any((message) =>
-                  message.direction == 'incoming' &&
-                  recovery!.acceptsIncoming(message.stableId,
-                      sentAt: message.sentAt, capturedAt: capture.capturedAt));
-          if (capturedNewIncoming) {
-            await _database.capSlaFallbackDue(
-              userId: customer,
-              dueAt:
-                  recovery.detectedAt.add(UnreadCaptureRecovery.holdingAfter),
-            );
-            if (recovery.holdingSentAt case final sentAt?) {
-              await _database.acknowledgeUncapturedHolding(
-                  userId: customer, sentAt: sentAt);
-              _slaFallbackTimers.remove(customer)?.cancel();
+            if (capturedNewIncoming ||
+                (recovery == null &&
+                    (capture != null || extraction.transferNoticeVisible))) {
+              _processingUnreadEvidence[customer] = row.unreadEvidence;
             }
-            _finishUnreadRecovery(customer);
-          }
-          if (capturedNewIncoming ||
-              (recovery == null &&
-                  (capture != null || extraction.transferNoticeVisible))) {
-            _processingUnreadEvidence[customer] = row.unreadEvidence;
-          }
-          await _database.ensurePendingForUnanswered(customer);
-          // Queue the durable current message immediately. Optional history
-          // scrolling must never prevent an already-saved customer turn from
-          // reaching Codex.
-          if (await _database.hasPendingUnanswered(customer)) {
-            _scheduleDraftGeneration(customer,
-                newEvidence: insertedForCustomer > 0);
-          }
-          if (extraction.transferNoticeVisible) {
-            await _handleTransferNotice(
-              customer,
-              extraction.transferNoticeKey ?? row.unreadEvidence.toString(),
-            );
-          }
+            await _database.ensurePendingForUnanswered(customer);
+            // Queue the durable current message immediately. Optional history
+            // scrolling must never prevent an already-saved customer turn from
+            // reaching Codex.
+            if (await _database.hasPendingUnanswered(customer)) {
+              _scheduleDraftGeneration(customer,
+                  newEvidence: insertedForCustomer > 0);
+            }
+            if (extraction.transferNoticeVisible) {
+              await _handleTransferNotice(
+                customer,
+                extraction.transferNoticeKey ?? row.unreadEvidence.toString(),
+              );
+            }
 
-          // Never scroll into history. Only the current bottom viewport may
-          // create work, so one unread turn cannot produce one historical
-          // reply followed by another reply for the actual latest item.
-          if (mounted) setState(() => _ocrInspection = inspection);
+            // Never scroll into history. Only the current bottom viewport may
+            // create work, so one unread turn cannot produce one historical
+            // reply followed by another reply for the actual latest item.
+            if (mounted) setState(() => _ocrInspection = inspection);
+          },
+              customer: row.identityNeedsAxVerification ? null : customer,
+              label: 'capture.customer',
+              priority: UiPriority.capture,
+              timeout: const Duration(seconds: 35));
         } on PlatformException catch (error) {
           _diagnosticLog.record('capture.customer_failed', fields: {
             'expected_customer': customer,
@@ -1780,11 +2267,7 @@ class _CaptureHomeState extends State<CaptureHome> {
         // Give an already-due holding message or delivery a turn before
         // switching to another customer. A busy multi-chat scan must not
         // monopolize the single JD UI queue past the response deadline.
-        if (!releaseUiOperation.isCompleted) releaseUiOperation.complete();
-        final queuedUiOperation = _jdUiTail;
-        releaseUiOperation = Completer<void>();
-        _jdUiTail = releaseUiOperation.future;
-        await queuedUiOperation;
+        _requestDelivery();
       }
       await _coordinator.refresh();
       if (mounted) {
@@ -1809,8 +2292,6 @@ class _CaptureHomeState extends State<CaptureHome> {
     } catch (error) {
       if (mounted) setState(() => _error = error);
     } finally {
-      captureCycleExited = true;
-      if (!releaseUiOperation.isCompleted) releaseUiOperation.complete();
       _autoCaptureBusy = false;
       _requestDelivery();
     }
@@ -1836,9 +2317,14 @@ class _CaptureHomeState extends State<CaptureHome> {
     // Preserve that queued answer and record the transfer as handled without
     // inserting a generic welcome in front of it.
     if (await _database.hasPendingUnanswered(userId) ||
-        await _database.hasUndeliveredDraft(userId)) {
+        await _database.hasUndeliveredDraft(userId) ||
+        _mediaAcquisitions
+            .forCustomer(userId)
+            .any((event) => !event.acquired)) {
       await _database.reserveTransferWelcome(
-          userId: userId, eventKey: eventKey);
+          userId: userId,
+          eventKey: eventKey,
+          minimumInterval: const Duration(minutes: 10));
       return;
     }
     await _sendTransferWelcomeOnce(userId, eventKey);
@@ -1846,7 +2332,9 @@ class _CaptureHomeState extends State<CaptureHome> {
 
   Future<bool> _sendTransferWelcomeOnce(String userId, String eventKey) async {
     if (!await _database.reserveTransferWelcome(
-        userId: userId, eventKey: eventKey)) {
+        userId: userId,
+        eventKey: eventKey,
+        minimumInterval: const Duration(minutes: 10))) {
       return false;
     }
     const welcome = LocalReplyRouter.transferWelcome;
@@ -1903,11 +2391,19 @@ class _CaptureHomeState extends State<CaptureHome> {
 
   Future<void> _runDraftWorker(
       String userId, CodexGenerationCancellation cancellation) async {
+    final mediaVersion = _mediaEvidenceVersions[userId] ?? 0;
     try {
       await _processDraftUser(userId, cancellation);
     } on CodexGenerationCancelled {
+      _diagnosticLog
+          .record('generation.cancelled', fields: {'customer': userId});
       // A later saved customer message owns the queued replacement turn.
     } on CodexGenerationTimedOut {
+      _diagnosticLog.record('generation.failed', fields: {
+        'customer': userId,
+        'reason': 'generation_deadline_exceeded',
+        'batch_end_message_id': _activeDraftMessageIds[userId],
+      });
       _scheduleDraftRetry(userId);
       // The holding-message sender must not retain this generation worker.
       // Its original 20-second deadline stays independent of the watchdog.
@@ -1915,6 +2411,11 @@ class _CaptureHomeState extends State<CaptureHome> {
         if (mounted) setState(() => _error = error);
       }));
     } on CodexReplyException catch (error) {
+      _diagnosticLog.record('generation.failed', fields: {
+        'customer': userId,
+        'reason': error.message,
+        'batch_end_message_id': _activeDraftMessageIds[userId],
+      });
       if (isCodexModelCapacityError(error.message)) {
         if (mounted) {
           const text =
@@ -1931,6 +2432,11 @@ class _CaptureHomeState extends State<CaptureHome> {
       }
       _scheduleDraftRetry(userId);
     } catch (error) {
+      _diagnosticLog.record('generation.failed', fields: {
+        'customer': userId,
+        'reason': error.toString(),
+        'batch_end_message_id': _activeDraftMessageIds[userId],
+      });
       if (mounted) setState(() => _error = error);
       _scheduleDraftRetry(userId);
     } finally {
@@ -1939,6 +2445,9 @@ class _CaptureHomeState extends State<CaptureHome> {
         _activeDraftMessageIds.remove(userId);
       }
       _activeDraftUsers.remove(userId);
+      if (mediaVersion != (_mediaEvidenceVersions[userId] ?? 0)) {
+        _scheduleDraftGeneration(userId, newEvidence: true);
+      }
       _runDraftWorkers();
       _requestDelivery();
     }
@@ -1948,12 +2457,14 @@ class _CaptureHomeState extends State<CaptureHome> {
     _draftRetryTimers.remove(userId)?.cancel();
     _draftRetryTimers[userId] = Timer(_draftFailureRetryDelay, () async {
       _draftRetryTimers.remove(userId);
-      if (!await _database.hasPendingUnanswered(userId) ||
-          await _database.isHumanContacting(userId)) {
-        return;
+      try {
+        await _database.repairPendingCaptures();
+        await _recoverOriginalReplyOutbox();
+        await _queueDraftIfPending(userId);
+      } catch (error) {
+        _scheduleDraftRetry(userId);
+        if (mounted) setState(() => _error = error);
       }
-      _draftQueue.add(userId);
-      _runDraftWorkers();
     });
   }
 
@@ -1969,10 +2480,30 @@ class _CaptureHomeState extends State<CaptureHome> {
     final conversation = matches.first;
     final messageIdAtGenerationStart = await _database.pendingMessageId(userId);
     if (messageIdAtGenerationStart == null) return;
+    if ((await (await _replyOutbox).pending())
+        .any((item) => item.userId == userId)) {
+      await _recoverOriginalReplyOutbox();
+      return;
+    }
     _activeDraftMessageIds[userId] = messageIdAtGenerationStart;
-    final service = await CodexReplyService.discover(_database);
+    final service = await CodexReplyService.discover(_database,
+        onDiagnostic: (event, fields) =>
+            _diagnosticLog.record(event, fields: fields));
+    final document = await (await _database.history).read(userId);
+    final rows =
+        (document?['messages'] as List<Object?>? ?? const []).whereType<Map>();
+    final boundary =
+        rows.where((m) => m['id'] == messageIdAtGenerationStart).firstOrNull;
+    final through = DateTime.tryParse(boundary?['sent_at']?.toString() ?? '');
+    final mediaVersion =
+        _mediaEvidenceVersions.revisionThrough(userId, through);
     cancellation.throwIfCancelled();
-    final draft = await service.generate(
+    _diagnosticLog.record('generation.started', fields: {
+      'customer': userId,
+      'batch_end_message_id': messageIdAtGenerationStart,
+      'media_revision': mediaVersion,
+    });
+    var draft = await service.generate(
         conversation: conversation,
         database: _database,
         batchEndMessageId: messageIdAtGenerationStart,
@@ -1992,14 +2523,44 @@ class _CaptureHomeState extends State<CaptureHome> {
       });
     }
     cancellation.throwIfCancelled();
+    if (mediaVersion !=
+        _mediaEvidenceVersions.revisionThrough(userId, through)) {
+      _diagnosticLog
+          .record('generation.result_superseded_by_new_media', fields: {
+        'customer': userId,
+        'batch_end_message_id': messageIdAtGenerationStart,
+        'started_media_revision': mediaVersion,
+        'current_media_revision':
+            _mediaEvidenceVersions.revisionThrough(userId, through),
+      });
+      return;
+    }
     if (await _promoteCodexDetectedVideo(conversation, draft)) {
       _scheduleDraftGeneration(userId, newEvidence: true);
       return;
     }
+    draft = withMediaEvidenceRevision(draft,
+        session: _mediaEvidenceSession,
+        revision: mediaVersion,
+        throughSentAt: through);
     final explicitTransfer = isExplicitHumanTransfer(draft);
+    if (!explicitTransfer) {
+      await (await _replyOutbox).save(OutboxReply(
+          userId: userId,
+          batchEndMessageId: messageIdAtGenerationStart,
+          draft: draft,
+          createdAt: DateTime.now()));
+    }
     final saved = await _database.saveDraft(conversation.id, draft,
         expectedMessageId: messageIdAtGenerationStart,
         deliverable: !explicitTransfer);
+    _diagnosticLog.record('generation.completed', fields: {
+      'customer': userId,
+      'batch_end_message_id': messageIdAtGenerationStart,
+      'draft_saved': saved > 0,
+      'original_outbox_retained': !explicitTransfer,
+      'decision': draft.decision,
+    });
     // Contacting or a manually observed seller reply may remove the queue
     // while Codex is generating. Never send a result from that stale turn.
     if (saved == 0 || await _database.isHumanContacting(userId)) return;
@@ -2009,20 +2570,22 @@ class _CaptureHomeState extends State<CaptureHome> {
       final messages = (document?['messages'] as List<Object?>? ?? const [])
           .whereType<Map<String, dynamic>>()
           .toList(growable: false);
-      final latestIncoming = messages.reversed
-          .firstWhere((message) => message['direction'] == 'incoming');
+      final requestMessage = messages.firstWhere((message) =>
+          message['direction'] == 'incoming' &&
+          message['id'] == messageIdAtGenerationStart);
       final ticket = await _database.createHumanReviewTicket(
         userId: userId,
-        customerRequest: latestIncoming['body']?.toString() ?? '',
+        customerRequest:
+            customerAuthoredText(requestMessage['body']?.toString() ?? ''),
         reason: draftHumanReviewReason(draft),
-        requestMessageId:
-            explicitTransfer ? latestIncoming['id']?.toString() : null,
+        requestMessageId: explicitTransfer ? messageIdAtGenerationStart : null,
       );
       await _refreshTickets();
       if (explicitTransfer) {
         // This draft records the transfer decision but must never be sent.
         // The transfer flow sends its own acknowledgement before handoff.
-        await _autoTransferTicket(ticket);
+        await _autoTransferTicket(ticket,
+            acknowledgement: transferNoticeForDraft(draft));
         await _database.discardTransferOnlyDraft(userId);
       }
       if (draft.attachments.isNotEmpty && mounted) {
@@ -2088,31 +2651,28 @@ class _CaptureHomeState extends State<CaptureHome> {
             y: region.y,
             width: region.width,
             height: region.height,
+            sourceInspection: inspection,
+            sourceSenderY: const OcrImageCandidateSelector()
+                .senderYForRegion(inspection, conversation.userId, region),
           );
           final fingerprint = visible.visualFingerprint ?? '';
           if (!_similarImageFingerprints(expectedFingerprint!, fingerprint)) {
             continue;
           }
-          final video = await _saveVisibleVideo(
+          final queued = await _saveVisibleVideo(
             conversation.userId,
             inspection.windowId,
             region,
             fingerprint,
+            sourceInspection: inspection,
+            sentAt: const OcrImageCandidateSelector()
+                .sentAtForRegion(inspection, conversation.userId, region),
           );
-          if (video == null) return false;
-          final inserted = await _database.saveCapture(CapturedConversation(
-            stableKey: conversation.stableKey,
-            customerName: conversation.customerName,
-            customerExternalId: conversation.userId,
-            verifiedCustomerId: inspection.activeCustomerId,
-            messages: [video],
-            capturedAt: inspection.capturedAt,
-          ));
-          if (inserted > 0 && mounted) {
+          if (queued && mounted) {
             setState(() => _diagnostics =
                 'Codex recognized a video thumbnail for ${conversation.userId}; downloaded it and queued the sampled frames for a second analysis.');
           }
-          return inserted > 0;
+          return queued;
         }
         return false;
       });
@@ -2146,6 +2706,271 @@ class _CaptureHomeState extends State<CaptureHome> {
     unawaited(_deliveryWorker?.request());
   }
 
+  Future<void> _recordOutboxReceipt(OutboxReply item,
+      {QueuedDelivery? expectedDelivery}) async {
+    final outbox = await _replyOutbox;
+    item.state = 'sent';
+    await outbox.save(item);
+    final store = await _database.history;
+    final document = await store.read(item.userId);
+    final alreadyRecorded =
+        (document?['messages'] as List<Object?>? ?? const [])
+            .whereType<Map<String, dynamic>>()
+            .any((message) {
+      final metadata = message['reply_metadata'];
+      final raw = metadata is Map ? metadata['raw_response'] : null;
+      return raw is Map &&
+          raw['delivery_batch_end_message_id'] == item.batchEndMessageId;
+    });
+    if (!alreadyRecorded) {
+      final raw = (jsonDecode(item.draft.rawJson) as Map<String, dynamic>)
+        ..['delivery_batch_end_message_id'] = item.batchEndMessageId;
+      await store.appendSentReply(
+          userId: item.userId,
+          displayName: item.userId,
+          stableKey: item.userId,
+          draft: AiDraft.fromJson(raw.cast<String, Object?>(),
+              mediaBaseUrl: Uri()));
+    }
+    // Delivery acknowledges only this frozen batch. Capturing a newer turn
+    // owns its own recovery and must not lose its timers to an older send.
+    if (expectedDelivery != null) {
+      await _database.markReplySent(
+          userId: item.userId,
+          reply: item.draft.reply,
+          recordHistory: false,
+          expectedDelivery: expectedDelivery);
+    } else {
+      await _database.acknowledgeOutboxReply(
+          userId: item.userId,
+          batchEndMessageId: item.batchEndMessageId,
+          reply: item.draft.reply);
+    }
+    await _scheduleSlaFallback(item.userId);
+    await outbox.remove(item.userId, item.batchEndMessageId);
+  }
+
+  Future<bool> _outboxSupersededByReply(OutboxReply item) async {
+    final document = await (await _database.history).read(item.userId);
+    final messages = (document?['messages'] as List<Object?>? ?? const [])
+        .whereType<Map<String, dynamic>>()
+        .toList();
+    // A human may answer while generation is still running, before the outbox
+    // entry's creation time. The exact answered batch + positive receipt is
+    // what matters; an outbox creation clock must not retain stale work.
+    return messages.any((message) => replyAnswersIncoming(
+        reply: message,
+        incomingId: item.batchEndMessageId,
+        messages: messages));
+  }
+
+  Future<void> _recoverOriginalReplyOutbox() async {
+    if (_outboxRecoveryBusy) return;
+    _outboxRecoveryBusy = true;
+    try {
+      await _recoverOriginalReplyOutboxOnce();
+    } finally {
+      _outboxRecoveryBusy = false;
+    }
+  }
+
+  Future<void> _recoverOriginalReplyOutboxOnce() async {
+    final outbox = await _replyOutbox;
+    for (final item in await outbox.pending()) {
+      if (!_autoCaptureRunning) return;
+      try {
+        if (item.state == 'sent') {
+          await _withJdUiOperation(() async {
+            final current = (await outbox.pending())
+                .where((entry) =>
+                    entry.userId == item.userId &&
+                    entry.batchEndMessageId == item.batchEndMessageId)
+                .firstOrNull;
+            if (current != null) await _recordOutboxReceipt(current);
+          });
+          continue;
+        }
+        if (await _outboxSupersededByReply(item)) {
+          await outbox.remove(item.userId, item.batchEndMessageId);
+          continue;
+        }
+        try {
+          if (await _database.isHumanContacting(item.userId)) continue;
+          if (item.state == 'sending') {
+            await _withJdUiOperation(() => _sendOutboxReplyUnlocked(item));
+            continue;
+          }
+          if (await _database.hasUndeliveredDraft(item.userId)) continue;
+          await _database.ensurePendingForUnanswered(item.userId);
+          final conversation = (await _database.conversations())
+              .where((conversation) => conversation.userId == item.userId)
+              .firstOrNull;
+          if (conversation == null) {
+            final restored = await _database.restoreUnsentOutboxDraft(
+                userId: item.userId,
+                batchEndMessageId: item.batchEndMessageId,
+                draft: item.draft);
+            _diagnosticLog
+                .record('delivery.original_bookkeeping_repaired', fields: {
+              'customer': item.userId,
+              'batch_end_message_id': item.batchEndMessageId,
+              'restored': restored,
+              'original_retained': true,
+            });
+            if (restored) _requestDelivery();
+            continue;
+          }
+          await _database.saveDraft(conversation.id, item.draft,
+              expectedMessageId: item.batchEndMessageId);
+          _requestDelivery();
+        } catch (error) {
+          if (!ResilientDatabase.isContention(error)) rethrow;
+          // Original answers are delivered from their own durable journal if
+          // SQLite is unavailable. Recipient verification and the common UI
+          // lock still apply exactly as in ordinary delivery.
+          await _withJdUiOperation(() => _sendOutboxReplyUnlocked(item));
+        }
+      } catch (error) {
+        _diagnosticLog.record('delivery.outbox_retry', fields: {
+          'customer': item.userId,
+          'state': item.state,
+          'error': error.toString(),
+        });
+      }
+    }
+  }
+
+  Future<void> _sendOutboxReplyUnlocked(OutboxReply original) async {
+    if (!_autoCaptureRunning ||
+        _transferringCustomers.contains(original.userId)) {
+      return;
+    }
+    final outbox = await _replyOutbox;
+    final item = (await outbox.pending())
+        .where((item) =>
+            item.userId == original.userId &&
+            item.batchEndMessageId == original.batchEndMessageId)
+        .firstOrNull;
+    if (item == null) return;
+    if (item.state == 'sent') {
+      await _recordOutboxReceipt(item);
+      return;
+    }
+    if (await _refreshReplyForNewMedia(item.userId, item.draft)) return;
+    if (await _outboxSupersededByReply(item)) {
+      await outbox.remove(item.userId, item.batchEndMessageId);
+      return;
+    }
+    await _adapter
+        .openConversation(item.userId, allowActivation: true)
+        .timeout(const Duration(seconds: 8));
+    if (item.state == 'sending') {
+      // A process interruption or uncertain native callback does not authorize
+      // a duplicate Send. Reconcile its exact visible outgoing receipt.
+      final windows =
+          await _adapter.listOcrWindows().timeout(_fallbackInspectionTimeout);
+      if (windows.isEmpty) return;
+      final window = windows.firstWhere(
+          (window) => window.title.contains('咚咚融合工作台'),
+          orElse: () => windows.first);
+      final inspection = await _adapter
+          .inspectExpectedCustomer(
+              windowId: window.windowId, expectedCustomer: item.userId)
+          .timeout(_fallbackInspectionTimeout);
+      final capture = const OcrCaptureExtractor().analyze(inspection).capture;
+      final receipt = capture?.messages.any((message) =>
+              message.direction == 'outgoing' &&
+              message.deliveryConfirmed &&
+              message.body.replaceAll(RegExp(r'\s+'), '') ==
+                  item.draft.reply.replaceAll(RegExp(r'\s+'), '') &&
+              message.sentAt != null &&
+              !message.sentAt!.isBefore(
+                  item.createdAt.subtract(const Duration(seconds: 1)))) ??
+          false;
+      if (receipt) {
+        await _recordOutboxReceipt(item);
+        return;
+      }
+      final exactQuestionVisible = capture?.messages.any((message) =>
+              message.direction == 'incoming' &&
+              message.stableId == item.batchEndMessageId) ??
+          false;
+      final latestVisibleIncoming =
+          capture?.messages.lastOrNull?.direction == 'incoming';
+      if (!await outbox.recordVerifiedAbsence(item,
+          exactUnansweredBubbleVisible:
+              exactQuestionVisible && latestVisibleIncoming)) {
+        return;
+      }
+    }
+    final sent = await outbox.sendReady(item,
+        send: (draft) async {
+          _verifyDraftMediaRevision(item.userId, draft);
+          await _adapter.sendDraftOnce(
+              expectedCustomer: item.userId,
+              reply: draft.reply,
+              mediaPaths: const []);
+        },
+        definitelyBeforeSend: (error) =>
+            error is PlatformException && _definitelyBeforeSend(error));
+    if (!sent) return;
+    await _recordOutboxReceipt(item);
+    _diagnosticLog.record('delivery.outbox_sent', fields: {
+      'customer': item.userId,
+      'batch_end_message_id': item.batchEndMessageId,
+    });
+  }
+
+  bool _definitelyBeforeSend(PlatformException error) => const {
+        'media_evidence_changed',
+        'final_customer_verification_failed',
+        'customer_switch_not_verified',
+        'composer_not_empty',
+        'owned_composer_recovery_failed',
+        'conversation_verification_failed',
+        'operation_expired',
+        'ui_worker_unavailable',
+        'ui_operation_cancelled',
+        'invalid_ui_operation',
+        'invalid_send_request',
+        'jd_unavailable',
+        'expected_conversation_missing',
+        'pre_insert_verification_failed',
+        'composer_read_failed',
+        'composer_not_settable',
+        'pre_send_verification_failed',
+        'send_click_failed',
+        'send_not_committed',
+      }.contains(error.code);
+
+  bool _draftHasNewMedia(String userId, AiDraft draft) =>
+      hasNewerMediaEvidence(draft,
+          session: _mediaEvidenceSession,
+          revision: _mediaEvidenceVersions.revisionThrough(
+              userId, mediaEvidenceBoundary(draft)));
+
+  void _verifyDraftMediaRevision(String userId, AiDraft draft) {
+    if (_draftHasNewMedia(userId, draft)) {
+      throw PlatformException(code: 'media_evidence_changed');
+    }
+  }
+
+  Future<bool> _refreshReplyForNewMedia(String userId, AiDraft draft) async {
+    if (!_draftHasNewMedia(userId, draft)) return false;
+    final outbox = await _replyOutbox;
+    final current = (await outbox.pending())
+        .where((item) =>
+            item.userId == userId && item.draft.rawJson == draft.rawJson)
+        .firstOrNull;
+    if (current != null && !await outbox.discardReady(current)) return false;
+    await _database.discardGeneratedDraft(userId,
+        expectedRawJson: draft.rawJson);
+    _diagnosticLog.record('generation.refresh_for_acquired_media',
+        fields: {'customer': userId});
+    _scheduleDraftGeneration(userId, newEvidence: true);
+    return true;
+  }
+
   Future<void> _handleDeliveryFailure(
       QueuedDelivery delivery, Object error, StackTrace stack) async {
     _diagnosticLog.record('delivery.failed', fields: {
@@ -2163,19 +2988,18 @@ class _CaptureHomeState extends State<CaptureHome> {
     if (mounted) setState(() => _error = error);
   }
 
-  Future<T> _withJdUiOperation<T>(Future<T> Function() operation) async {
-    _pendingJdUiOperations++;
-    final previous = _jdUiTail;
-    final release = Completer<void>();
-    _jdUiTail = release.future;
-    await previous;
-    try {
-      return await operation();
-    } finally {
-      _pendingJdUiOperations--;
-      release.complete();
-    }
-  }
+  Future<T> _withJdUiOperation<T>(
+    Future<T> Function() operation, {
+    String? customer,
+    String label = 'ui.operation',
+    UiPriority priority = UiPriority.maintenance,
+    Duration timeout = const Duration(seconds: 30),
+  }) =>
+      _uiScheduler.schedule(operation,
+          customer: customer,
+          label: label,
+          priority: priority,
+          timeout: timeout);
 
   Future<T> _withFallbackPriority<T>(Future<T> Function() operation) async {
     // All customer-changing work shares one queue. Priority remains visible to
@@ -2183,7 +3007,8 @@ class _CaptureHomeState extends State<CaptureHome> {
     // chat while another customer's image capture is still validating it.
     _priorityUiOperations++;
     try {
-      return await _withJdUiOperation(operation);
+      return await _withJdUiOperation(operation,
+          priority: UiPriority.fallback, label: 'delivery.fallback');
     } finally {
       _priorityUiOperations--;
     }
@@ -2201,6 +3026,7 @@ class _CaptureHomeState extends State<CaptureHome> {
         await _database.isHumanContacting(userId)) {
       return false;
     }
+    if (await _refreshReplyForNewMedia(userId, draft)) return false;
     final uiAcquiredAt = DateTime.now();
     _diagnosticLog.record('delivery.ui_acquired', fields: {
       'expected_customer': userId,
@@ -2233,19 +3059,39 @@ class _CaptureHomeState extends State<CaptureHome> {
           await _database.isHumanContacting(userId)) {
         return false;
       }
-      await _adapter.sendDraftOnce(
-        expectedCustomer: userId,
-        reply: draft.reply,
-        mediaPaths: mediaPaths,
-      );
-      final recorded = await _database.markReplySent(
-          userId: userId, reply: draft.reply, expectedDelivery: delivery);
-      if (!recorded) return true; // A newer batch owns the current queue now.
-      _finishUnreadRecovery(userId);
-      _slaFallbackTimers.remove(userId)?.cancel();
+      final outbox = await _replyOutbox;
+      final existing = (await outbox.pending())
+          .where((item) =>
+              item.userId == userId &&
+              item.batchEndMessageId == delivery.batchEndMessageId)
+          .firstOrNull;
+      if (existing != null && existing.state != 'ready') {
+        await _sendOutboxReplyUnlocked(existing);
+        return existing.state == 'sent';
+      }
+      final durableReply = existing ??
+          OutboxReply(
+              userId: userId,
+              batchEndMessageId: delivery.batchEndMessageId ?? '',
+              draft: draft,
+              createdAt:
+                  DateTime.fromMillisecondsSinceEpoch(delivery.createdAtMs));
+      if (existing == null) await outbox.save(durableReply);
+      final sent = await outbox.sendReady(durableReply,
+          send: (answer) async {
+            _verifyDraftMediaRevision(userId, answer);
+            await _adapter.sendDraftOnce(
+                expectedCustomer: userId,
+                reply: answer.reply,
+                mediaPaths: mediaPaths);
+          },
+          definitelyBeforeSend: (error) =>
+              error is PlatformException && _definitelyBeforeSend(error));
+      if (!sent) return false;
+      await _recordOutboxReceipt(durableReply, expectedDelivery: delivery);
       _scheduleDraftGeneration(userId, newEvidence: false);
       final evidence = _processingUnreadEvidence[userId];
-      if (evidence != null) {
+      if (evidence != null && !_unreadRecovery.containsKey(userId)) {
         _handledUnreadEvidence[userId] = evidence;
         _handledUnreadAt[userId] = DateTime.now();
       }
@@ -2277,8 +3123,7 @@ class _CaptureHomeState extends State<CaptureHome> {
     OcrExtractionAttempt extraction, {
     bool allowUnlabeledLatestImage = false,
     bool allowRecoveryAfterHolding = false,
-    bool allowVideoDetectionActivation = false,
-    _RunVideoProcessingUnlocked? runVideoProcessingUnlocked,
+    int mediaRefreshAttempt = 0,
   }) async {
     final customer = extraction.customerId ?? extraction.capture?.customerName;
     if (customer != null &&
@@ -2318,18 +3163,31 @@ class _CaptureHomeState extends State<CaptureHome> {
         viewportFallbackRegions.add(fallback);
       }
     }
+    imageCandidates =
+        _ocrMediaMasks.restoreCandidates(inspection, customer, imageCandidates);
+    // Retain the full sender-bound footprint even when this scan sees only
+    // a tiny play/control rectangle (or no rectangle at all).
+    final priorMediaMasks = _ocrMediaMasks.regions(inspection, customer);
+    if (priorMediaMasks.isNotEmpty) {
+      textCapture = extraction.textExcludingMedia(inspection, priorMediaMasks);
+    }
     if ((latestVisible?.direction == 'outgoing' && !onlyOurHoldingIsBelow) ||
         extraction.latestIncomingHasText) {
       imageCandidates = imageCandidates.where((region) {
-        final bottom = region.y + region.height;
-        final sellerActivityBelow = inspection.observations.any((item) {
-          final text = item.text.trim();
-          final sellerLabel = (text.contains('旗舰店') &&
-                  (text.contains(':') || text.contains('：'))) ||
-              RegExp(r'格志打印机[\u3400-\u9fffA-Za-z0-9_-]{1,12}').hasMatch(text);
-          return sellerLabel && item.y > bottom + .005;
+        final eligible = candidateSelector.mayCaptureWithLaterActivity(
+            inspection, customer, region);
+        _diagnosticLog.record('capture.media_candidate_routing', fields: {
+          'customer': customer,
+          'message_at': candidateSelector
+              .sentAtForRegion(inspection, customer, region)
+              ?.toUtc()
+              .toIso8601String(),
+          'eligible': eligible,
+          'reason': eligible
+              ? 'customer_media_independent_of_later_reply'
+              : 'historical_or_unstamped_media_below_seller_activity',
         });
-        return !sellerActivityBelow;
+        return eligible;
       }).toList(growable: false);
     }
     if (!extraction.latestVisibleSenderIsIncoming &&
@@ -2341,29 +3199,52 @@ class _CaptureHomeState extends State<CaptureHome> {
       return textCapture;
     }
     final capturedMedia = <CapturedMessage>[];
-    // Automatic image capture prefers a strongly matched original from JD's
-    // cache and falls back to the verified screenshot without opening JD's
-    // image viewer. A detected video uses JD's bounded local cache copy.
-    // Only the newest candidate can create work.
-    imageCandidates = imageCandidates.take(1).toList(growable: false);
+    // Prefer verified originals. A sender/snapshot-verified attachment preview
+    // is retained explicitly as partial evidence, never called an original.
+    // Visit every customer-owned bubble in message order. A duplicate or a
+    // failed acquisition must never hide the remaining images/videos.
+    imageCandidates.sort((a, b) => a.y.compareTo(b.y));
+    var queuedVideos = 0;
     var failures = 0;
     final inspectedMediaSources = <String>[];
-    final confirmedMediaRegions = <OcrVisualRegion>[];
-    if ((!extraction.latestIncomingHasText || imageCandidates.isNotEmpty) &&
-        _unreadRecovery[customer] != null) {
-      final recovery = _unreadRecovery[customer]!;
+    final confirmedMediaRegions = <OcrVisualRegion>[...priorMediaMasks];
+    final mediaRecovery = _unreadRecovery[customer];
+    // Every verified new-message recovery must inspect JD's cache, including
+    // turns where text OCR succeeded. A customer can send text and media in
+    // the same turn, and successful text extraction is not evidence that the
+    // accompanying image/video was captured.
+    // Candidate regions perform their own read-only cache lookup below; do not
+    // enumerate the shared directory twice before verifying an original.
+    final shouldProbeDirectMedia = imageCandidates.isEmpty &&
+        mediaRecovery != null &&
+        mediaRecovery.directMediaProbeDue(DateTime.now());
+    if (shouldProbeDirectMedia) {
+      final recovery = mediaRecovery;
+      recovery.recordDirectMediaProbe(DateTime.now());
       try {
-        final cached = await _captureDirectCachedMedia(
-          customer,
-          recovery,
-          runVideoProcessingUnlocked: runVideoProcessingUnlocked,
-        ).timeout(_captureOperationTimeout);
-        if (cached != null) {
-          capturedMedia.add(cached);
-          inspectedMediaSources.add('direct-jd-cache');
-          if (imageCandidates.isNotEmpty) {
-            confirmedMediaRegions.add(imageCandidates.first);
+        final senderAt = extraction.latestIncomingSentAt;
+        if (recovery.hasVerifiedIncomingSignal &&
+            senderAt != null &&
+            extraction.latestVisibleSenderIsIncoming &&
+            !extraction.latestIncomingHasText) {
+          // Pale/black previews may have NO Vision rectangle. Restore the
+          // old direct cache route for a verified media-only sender as well.
+          final direct = await _captureDirectCachedVideo(
+              customer, inspection.windowId, senderAt);
+          if (direct != null) {
+            final event = _mediaAcquisitions.observe(customer,
+                uploadEventKey(senderAt, 0), senderAt, inspection.capturedAt)
+              ..acquired = true;
+            if (direct) queuedVideos++;
+            await (await _database.history)
+                .recordMediaAcquisition(customer, event.toJson());
+            inspectedMediaSources
+                .add('819ce2a-direct-jd-video-cache-without-preview');
           }
+        } else {
+          await _probeRecentMediaCache(customer, recovery)
+              .timeout(_unreadOperationTimeout);
+          inspectedMediaSources.add('discovery-only-jd-cache');
         }
       } on PlatformException {
         failures++;
@@ -2371,29 +3252,69 @@ class _CaptureHomeState extends State<CaptureHome> {
         failures++;
       }
     }
-    for (final region in capturedMedia.isEmpty
-        ? imageCandidates
-        : const <OcrVisualRegion>[]) {
+    var refreshRequired = false;
+    final mediaSlots = <int, int>{};
+    for (final region in imageCandidates) {
+      String? attemptedMediaKind;
+      final messageAt =
+          candidateSelector.sentAtForRegion(inspection, customer, region);
+      final slot = messageAt == null
+          ? 0
+          : mediaSlots[mediaMessageSecond(messageAt)] ?? 0;
+      void confirmMediaSlot() {
+        if (messageAt != null) {
+          mediaSlots[mediaMessageSecond(messageAt)] = slot + 1;
+        }
+      }
+
+      final allowPreview = candidateSelector.mayRetainAttachmentPreview(
+          inspection, customer, region);
+      MediaAcquisition? event;
       try {
-        final messageAt = _unreadRecovery[customer]?.detectedAt ??
-            (extraction.latestVisibleSenderIsIncoming
-                ? extraction.latestIncomingSentAt
-                : null);
-        final expectedMediaAt = messageAt ?? inspection.capturedAt;
+        // 819ce2a's direct cache acquisition precedes ALL screenshot/play-icon
+        // classification for a non-text sender region. Readable text needs a
+        // visual original-file match; a cache clock must not turn "hi" into video.
+        if (messageAt != null &&
+            !candidateSelector.hasReadableText(
+                region, inspection.observations)) {
+          final direct = await _captureDirectCachedVideo(
+              customer, inspection.windowId, messageAt,
+              sourceEventKey: uploadEventKey(messageAt, slot));
+          if (direct != null) {
+            confirmMediaSlot();
+            await _recordVerifiedUpload(
+                inspection, customer, region, messageAt, slot);
+            confirmedMediaRegions.add(region);
+            if (direct) queuedVideos++;
+            inspectedMediaSources.add('819ce2a-direct-jd-video-cache');
+            continue;
+          }
+        }
+        final expectedMediaAt = messageAt ??
+            _unreadRecovery[customer]?.eventAt ??
+            inspection.capturedAt;
         final visible = await _adapter
-            .captureImageRegion(
+            .captureCachedMediaRegion(
               expectedCustomer: customer,
               windowId: inspection.windowId,
-              x: region.x,
-              y: region.y,
-              width: region.width,
-              height: region.height,
+              region: region,
               expectedMediaAt: expectedMediaAt,
-              allowActivationForVideoDetection: allowVideoDetectionActivation,
+              sourceInspection: inspection,
+              sourceSenderY: candidateSelector.senderYForRegion(
+                  inspection, customer, region),
+              allowAttachmentPreview: allowPreview,
+              previewTextRegions:
+                  candidateSelector.previewTextRegions(inspection, region),
             )
             .timeout(_unreadOperationTimeout);
+        if (visible == null) {
+          // Normal cache miss: no upload event, mask, menu, generation wait,
+          // or shared cleanup state. Keep the text and inspect the next item.
+          inspectedMediaSources.add('cache-miss-text-preserved');
+          continue;
+        }
         inspectedMediaSources.add(visible.captureSource ?? visible.kind);
-        var turnAt = messageAt;
+        attemptedMediaKind = visible.kind;
         // The sender label can sit above OCR's text band while the media
         // thumbnail is still clearly visible. Start the 20-second recovery
         // clock before a video cache copy or frame extraction can stall.
@@ -2408,75 +3329,235 @@ class _CaptureHomeState extends State<CaptureHome> {
             !await (await _database.history).hasSimilarImageFingerprint(
               customer,
               visible.visualFingerprint!,
-              capturedAfter: turnAt,
             )) {
           await _beginUnreadRecovery(customer, 0,
               detectedAt: inspection.capturedAt);
-          turnAt = _unreadRecovery[customer]?.detectedAt ?? turnAt;
         }
         if (visible.kind == 'video') {
+          confirmMediaSlot();
           // Classification itself is enough to reject OCR text inside the
           // thumbnail, even if the cache copy must be retried later.
           confirmedMediaRegions.add(region);
-          final saved = await _saveVisibleVideo(
+          if (messageAt != null) {
+            event = await _recordVerifiedUpload(
+                inspection, customer, region, messageAt, slot);
+          }
+          final queued = await _saveVisibleVideo(
             customer,
             inspection.windowId,
             region,
             visible.visualFingerprint ?? '',
-            sentAt: turnAt,
-            runVideoProcessingUnlocked: runVideoProcessingUnlocked,
+            sourceInspection: inspection,
+            sentAt: messageAt,
+            cacheReferenceToken: visible.cacheReferenceToken,
+            sourceEventKey:
+                messageAt == null ? null : uploadEventKey(messageAt, slot),
           );
-          if (saved != null) {
-            capturedMedia.add(saved);
-          }
-        } else if (visible.kind == 'image' && visible.bytes != null) {
+          if (queued) queuedVideos++;
+          if (event != null) event.acquired = true;
+        } else if ((visible.kind == 'image' ||
+                visible.kind == 'attachment_preview') &&
+            visible.bytes != null) {
           // A rectangle around a long ordinary text bubble can look like an
           // image to Vision. A screenshot matched pixel-for-pixel to an
           // original in JD's image cache is already verified media, however,
           // and must not be discarded merely because the image itself contains
           // a lot of readable text.
           final cacheOriginal = visible.captureSource == 'jd-image-cache';
-          if (candidateSelector.shouldSaveImage(
-            region,
-            inspection.observations,
-            fromVerifiedCache: cacheOriginal,
-          )) {
+          final retainedPreview = allowPreview &&
+              visible.kind == 'attachment_preview' &&
+              visible.captureSource == 'verified-window-preview';
+          if (retainedPreview && messageAt != null) {
+            final key = uploadEventKey(messageAt, slot);
+            final single = imageCandidates
+                    .where((r) =>
+                        candidateSelector.sentAtForRegion(
+                            inspection, customer, r) ==
+                        messageAt)
+                    .length ==
+                1;
+            final queue = await _videoCaptureQueue;
+            await queue.initialize();
+            if (queue.hasEvent(customer, messageAt, key,
+                    singleVisibleBubble: single) ||
+                await (await _database.history).hasOriginalMediaEvent(
+                    customer, messageAt, key,
+                    singleVisibleBubble: single)) {
+              confirmMediaSlot();
+              confirmedMediaRegions.add(region);
+              await _recordVerifiedUpload(
+                  inspection, customer, region, messageAt, slot);
+              _diagnosticLog
+                  .record('capture.redundant_preview_skipped', fields: {
+                'customer': customer,
+                'event_key': key,
+                'message_at': messageAt.toUtc().toIso8601String(),
+              });
+              continue;
+            }
+          }
+          if (!cacheOriginal && !retainedPreview) {
+            throw PlatformException(code: 'media_original_not_verified');
+          }
+          if (retainedPreview ||
+              candidateSelector.shouldSaveImage(
+                region,
+                inspection.observations,
+                fromVerifiedCache: cacheOriginal,
+              )) {
+            confirmMediaSlot();
             confirmedMediaRegions.add(region);
+            if (messageAt != null) {
+              event = await _recordVerifiedUpload(
+                  inspection, customer, region, messageAt, slot);
+            }
             final saved = await _saveVisibleImage(
               customer,
               visible,
-              sentAt: turnAt,
+              sentAt: messageAt,
               viewportFallback: viewportFallbackRegions
                   .any((item) => identical(item, region)),
               cacheCopy: cacheOriginal,
+              sourceEventKey:
+                  messageAt == null ? null : uploadEventKey(messageAt, slot),
+              attachmentPreview: retainedPreview,
             );
             if (saved != null) {
               capturedMedia.add(saved);
+              // Persist each acquired image before attempting the next item.
+              // A later native timeout must not lose earlier captured media.
+              final inserted = await _database.saveCapture(CapturedConversation(
+                  stableKey:
+                      'customer:${sha256.convert(utf8.encode(customer))}',
+                  customerName: customer,
+                  customerExternalId: customer,
+                  verifiedCustomerId: customer,
+                  messages: [saved],
+                  capturedAt: inspection.capturedAt));
+              if (inserted > 0) {
+                _mediaEvidenceVersions.record(
+                    customer, saved.stableId, MediaEvidenceStage.ready,
+                    sentAt: saved.sentAt);
+              }
+              _diagnosticLog.record('capture.media_saved', fields: {
+                'customer': customer,
+                'kind': 'image',
+                'evidence': retainedPreview
+                    ? 'partial_attachment_preview'
+                    : 'cache_original',
+                'message_id': saved.stableId,
+                'message_at': saved.sentAt?.toUtc().toIso8601String()
+              });
             }
+            if (event != null) event.acquired = true;
           }
         }
-      } on PlatformException {
+        if (event?.acquired == true) {
+          await (await _database.history)
+              .recordMediaAcquisition(customer, event!.toJson());
+        }
+      } on PlatformException catch (error) {
         failures++;
+        if (event != null) {
+          event.failure = error.code;
+          await (await _database.history)
+              .recordMediaAcquisition(customer, event.toJson());
+        }
+        _diagnosticLog.record('capture.media_item_failed', fields: {
+          'customer': customer,
+          'kind': attemptedMediaKind,
+          'message_at': messageAt?.toUtc().toIso8601String(),
+          'code': error.code,
+        });
+        if (error.code == 'media_snapshot_changed') {
+          // Do not reuse any remaining coordinates after a scroll, warning,
+          // resize or newly inserted message. The next poll re-runs OCR.
+          _diagnosticLog.record('capture.media_rescan_required',
+              fields: {'customer': customer});
+          refreshRequired = true;
+          break;
+        }
+        if (attemptedMediaKind == 'video') {
+          await (await _database.history).recordMediaCaptureFailure(
+              customer, 'video',
+              sentAt: messageAt, reason: error.code);
+        }
         // One invalid visual rectangle must not discard other candidates or
         // text already extracted from the visible conversation.
       } on TimeoutException {
         failures++;
+        if (event != null) {
+          event.failure = 'media_acquisition_timeout';
+          await (await _database.history)
+              .recordMediaAcquisition(customer, event.toJson());
+        }
+        if (attemptedMediaKind == 'video') {
+          await (await _database.history).recordMediaCaptureFailure(
+              customer, 'video',
+              sentAt: messageAt, reason: 'video_capture_timeout');
+        }
         // A stalled native media operation cannot hold the JD UI queue past
         // the customer's fallback deadline.
+      } catch (error) {
+        failures++;
+        _diagnosticLog.record('capture.media_item_failed', fields: {
+          'customer': customer,
+          'message_at': messageAt?.toUtc().toIso8601String(),
+          'kind': attemptedMediaKind,
+          'error': error.toString(),
+        });
+        // Disk/decoder failures are scoped to this item, not the entire batch.
       }
     }
     _visibleMediaTrace =
-        'strict routing: image -> verified cache original or screenshot, video -> cache + 1fps frames; candidates='
-        '${imageCandidates.length}, captured=${capturedMedia.length}, '
+        'strict routing: cache originals first, verified attachment previews second; candidates='
+        '${imageCandidates.length}, captured=${capturedMedia.length}, video_jobs=$queuedVideos, '
         'failures=$failures, sources=${inspectedMediaSources.join(',')}; '
         'JD image viewer was not opened';
     if (confirmedMediaRegions.isNotEmpty) {
       // Re-read text with the verified media rectangles masked. Otherwise OCR
       // of a play icon or text displayed *inside* a video can close unread
       // recovery and generate a reply to a fabricated customer sentence.
-      textCapture = const OcrCaptureExtractor()
-          .analyze(inspection, excludedMediaRegions: confirmedMediaRegions)
-          .capture;
+      textCapture =
+          extraction.textExcludingMedia(inspection, confirmedMediaRegions);
+    }
+    if (refreshRequired) {
+      // The old OCR snapshot is no longer proof of typed text. Only acquired
+      // originals survive a failed refresh; never merge stale thumbnail OCR.
+      textCapture = null;
+    }
+    if (refreshRequired && mediaRefreshAttempt == 0) {
+      try {
+        final fresh = await _adapter
+            .inspectExpectedCustomer(
+                windowId: inspection.windowId,
+                expectedCustomer: customer,
+                maximumAttempts: 1,
+                fast: false)
+            .timeout(_fallbackInspectionTimeout);
+        final retry = await _captureWithVisibleMedia(
+            fresh, const OcrCaptureExtractor().analyze(fresh),
+            allowUnlabeledLatestImage: allowUnlabeledLatestImage,
+            allowRecoveryAfterHolding: allowRecoveryAfterHolding,
+            mediaRefreshAttempt: 1);
+        if (retry != null) {
+          final merged = <String, CapturedMessage>{
+            for (final m in [...capturedMedia, ...retry.messages])
+              m.stableId: m,
+          };
+          return CapturedConversation(
+              stableKey: retry.stableKey,
+              customerName: customer,
+              customerExternalId: customer,
+              verifiedCustomerId: customer,
+              messages: merged.values.toList(),
+              capturedAt: fresh.capturedAt);
+        }
+      } on PlatformException catch (_) {
+        // A different customer or failed refresh never authorizes old coordinates.
+      } on TimeoutException catch (_) {
+        // Other customers regain the UI queue; the bounded next poll retries.
+      }
     }
     if (capturedMedia.isEmpty) return textCapture;
     final uniqueMedia = <String, CapturedMessage>{
@@ -2493,105 +3574,115 @@ class _CaptureHomeState extends State<CaptureHome> {
     );
   }
 
-  Future<CapturedMessage?> _captureDirectCachedMedia(
-    String customer,
-    UnreadCaptureRecovery recovery, {
-    _RunVideoProcessingUnlocked? runVideoProcessingUnlocked,
-  }) async {
-    final store = await _database.history;
-    final videoDestination = Directory(
-      '${store.mediaDirectory.path}/${store.safeUserId(customer)}/videos',
-    );
-    await videoDestination.create(recursive: true);
-    final cached = await _adapter.captureRecentCachedMedia(
-      expectedCustomer: customer,
-      expectedMediaAt: recovery.detectedAt,
-      destinationDirectory: videoDestination.path,
-    );
-    if (cached == null) return null;
-    if (!_claimDirectCachedMedia(customer, recovery, cached)) {
-      await _deleteRejectedCachedVideo(cached.video);
-      return null;
-    }
-    if (cached.image case final image?) {
-      return _saveVisibleImage(
-        customer,
-        image,
-        sentAt: recovery.detectedAt,
-        cacheCopy: true,
-      );
-    }
-    if (cached.video case final video?) {
-      if (cached.cacheKey.isEmpty ||
-          await store.hasSimilarImageFingerprint(
-            customer,
-            cached.cacheKey,
-            maximumDistance: 0,
-            captureSources: const {'jd_video_cache'},
-            capturedAfter: recovery.detectedAt,
-          )) {
-        await _deleteRejectedCachedVideo(video);
-        return null;
-      }
-      return _processDownloadedVideo(
-        customer,
-        video,
-        cached.cacheKey,
-        sentAt: recovery.detectedAt,
-        runVideoProcessingUnlocked: runVideoProcessingUnlocked,
-      );
-    }
-    return null;
-  }
-
-  bool _claimDirectCachedMedia(
+  Future<void> _probeRecentMediaCache(
     String customer,
     UnreadCaptureRecovery recovery,
-    CachedMediaPayload cached,
-  ) {
-    if (cached.cacheKey.isEmpty ||
-        cached.cacheModifiedAt.millisecondsSinceEpoch == 0) {
-      return false;
+  ) async {
+    final probe = await _adapter.probeRecentCachedMedia(
+      expectedCustomer: customer,
+      expectedMediaAt: recovery.eventAt,
+    );
+    _diagnosticLog.record('capture.media_cache_probed', fields: {
+      'customer': customer,
+      'candidate_found': probe['candidateFound'],
+      'candidate_count': probe['cacheCandidateCount'],
+      'selection_ambiguous': probe['cacheSelectionAmbiguous'],
+      'action': 'visible_customer_media_cross_check_required',
+      'reason': probe['reason'],
+    });
+  }
+
+  Future<bool> _completeAttachmentDownload(
+      AttachmentDownloadTicket ticket) async {
+    final store = await _database.history;
+    final own = Directory(
+        '${store.mediaDirectory.path}/${store.safeUserId(ticket.customer)}/attachment_exports');
+    final actual = await Directory(ticket.directory).resolveSymbolicLinks();
+    if (!actual.startsWith('${await own.resolveSymbolicLinks()}/')) {
+      throw StateError(
+          'Attachment download is outside this customer’s private directory.');
     }
-    if (!UnreadCaptureRecovery.cacheClockUniquelyMatches(
-      modifiedAt: cached.cacheModifiedAt,
-      targetCustomer: customer,
-      recoveries: _unreadRecovery,
-    )) {
-      return false;
+    final original = await _adapter.pollAttachmentDownload(ticket);
+    if (original == null) return false;
+    if (original.kind == 'image') {
+      final message = await _saveVisibleImage(ticket.customer, original,
+          sentAt: ticket.sentAt, originalDownload: true);
+      if (message != null) {
+        final capturedAt = DateTime.now();
+        final inserted = await _database.saveCapture(CapturedConversation(
+            stableKey:
+                'customer:${sha256.convert(utf8.encode(ticket.customer))}',
+            customerName: ticket.customer,
+            customerExternalId: ticket.customer,
+            verifiedCustomerId: ticket.customer,
+            messages: [message],
+            capturedAt: capturedAt));
+        if (inserted > 0) {
+          _mediaEvidenceVersions.record(
+              ticket.customer, message.stableId, MediaEvidenceStage.ready,
+              sentAt: message.sentAt);
+        }
+        final recovery = _unreadRecovery[ticket.customer];
+        if (recovery != null &&
+            recovery.acceptsIncoming(message.stableId,
+                sentAt: message.sentAt, capturedAt: capturedAt)) {
+          if (recovery.holdingSentAt case final at?) {
+            await _database.acknowledgeUncapturedHolding(
+                userId: ticket.customer, sentAt: at);
+          }
+          _finishUnreadRecovery(ticket.customer, expectedRecovery: recovery);
+        }
+      }
+    } else if (original.downloadedVideo case final video?) {
+      await _enqueueDownloadedVideo(ticket.customer, video, '',
+          sentAt: ticket.sentAt);
+    } else {
+      throw StateError('Attachment original has no validated payload.');
     }
-    final existingOwner = _claimedJdCacheMediaOwners[cached.cacheKey];
-    if (existingOwner != null && existingOwner != customer) {
-      return false;
-    }
-    _claimedJdCacheMediaOwners[cached.cacheKey] = customer;
+    final event = _mediaAcquisitions.observe(
+        ticket.customer, ticket.eventKey, ticket.sentAt, ticket.startedAt)
+      ..acquired = true
+      ..attachmentFallbackStarted = true;
+    await store.recordMediaAcquisition(ticket.customer, event.toJson());
+    _diagnosticLog.record('capture.attachment_original_saved', fields: {
+      'customer': ticket.customer,
+      'event_key': ticket.eventKey,
+      'kind': original.kind,
+      'message_at': ticket.sentAt.toUtc().toIso8601String(),
+    });
+    await _coordinator.refresh();
     return true;
   }
 
-  Future<void> _deleteRejectedCachedVideo(DownloadedVideoPayload? video) async {
-    if (video == null || video.path.isEmpty) return;
-    final file = File(video.path);
-    if (await file.exists()) await file.delete();
+  Future<void> _attachmentDownloadFailed(
+      AttachmentDownloadTicket ticket, Object error) async {
+    final event = _mediaAcquisitions.observe(
+        ticket.customer, ticket.eventKey, ticket.sentAt, ticket.startedAt)
+      ..failure = 'attachment_download_failed'
+      ..attachmentFallbackStarted = true;
+    _diagnosticLog.record('capture.attachment_download_failed', fields: {
+      'customer': ticket.customer,
+      'event_key': ticket.eventKey,
+      'error': error.toString(),
+    });
+    await (await _database.history)
+        .recordMediaAcquisition(ticket.customer, event.toJson());
   }
 
-  Future<CapturedMessage?> _saveVisibleVideo(
+  Future<bool> _saveVisibleVideo(
     String customer,
     int windowId,
     OcrVisualRegion region,
     String thumbnailFingerprint, {
+    required OcrInspection sourceInspection,
     DateTime? sentAt,
-    _RunVideoProcessingUnlocked? runVideoProcessingUnlocked,
+    String? cacheReferenceToken,
+    String? sourceEventKey,
   }) async {
     final store = await _database.history;
-    if (thumbnailFingerprint.isNotEmpty &&
-        await store.hasSimilarImageFingerprint(
-          customer,
-          thumbnailFingerprint,
-          captureSources: const {'jd_video_cache', 'jd_video_save_as'},
-          capturedAfter: sentAt,
-        )) {
-      return null;
-    }
+    // Similar thumbnails cannot identify a message: a customer may resend the
+    // same video or two distinct clips can show the same printer. Deduplicate
+    // only after acquiring verified bytes and reading this bubble's timestamp.
     final destination = Directory(
       '${store.mediaDirectory.path}/${store.safeUserId(customer)}/videos',
     );
@@ -2604,17 +3695,217 @@ class _CaptureHomeState extends State<CaptureHome> {
           y: region.y,
           width: region.width,
           height: region.height,
+          expectedMediaAt: sentAt,
           destinationDirectory: destination.path,
+          cacheReferenceToken: cacheReferenceToken,
+          sourceInspection: sourceInspection,
+          sourceSenderY: const OcrImageCandidateSelector()
+              .senderYForRegion(sourceInspection, customer, region),
         )
         .timeout(_unreadOperationTimeout);
-    if (downloaded.path.isEmpty) return null;
-    return _processDownloadedVideo(
-      customer,
-      downloaded,
-      thumbnailFingerprint,
-      sentAt: sentAt,
-      runVideoProcessingUnlocked: runVideoProcessingUnlocked,
-    );
+    if (downloaded.path.isEmpty) return false;
+    return _enqueueDownloadedVideo(customer, downloaded, thumbnailFingerprint,
+        sentAt: sentAt, sourceEventKey: sourceEventKey);
+  }
+
+  /// Null means no safe cache match; false means acquired but already queued
+  /// or saved. Neither requires a Save As dialog or screenshot classification.
+  Future<bool?> _captureDirectCachedVideo(
+      String customer, int windowId, DateTime sentAt,
+      {String? sourceEventKey}) async {
+    final store = await _database.history;
+    final destination = Directory(
+        '${store.mediaDirectory.path}/${store.safeUserId(customer)}/videos');
+    await destination.create(recursive: true);
+    final competing = <DateTime>{
+      ..._mediaAcquisitions.competingTimes(customer, sentAt),
+      for (final entry in _unreadRecovery.entries)
+        if (entry.key != customer) entry.value.eventAt,
+    };
+    final cached = await _adapter
+        .captureRecentCachedVideo(
+            expectedCustomer: customer,
+            windowId: windowId,
+            expectedMediaAt: sentAt,
+            destinationDirectory: destination.path,
+            competingMessageTimes: competing)
+        .timeout(_unreadOperationTimeout);
+    if (cached == null) return null;
+    if (!await (await _cacheVideoClaims)
+        .claim(cached.cacheKey, customer, sentAt)) {
+      if (cached.createdCopy) {
+        final file = File(cached.video.path);
+        final actual = await file.resolveSymbolicLinks();
+        final own = await destination.resolveSymbolicLinks();
+        if (actual.startsWith('$own/')) await file.delete();
+      }
+      _diagnosticLog.record('capture.cache_video_claim_rejected', fields: {
+        'customer': customer,
+        'message_at': sentAt.toUtc().toIso8601String(),
+        'reason': 'cache_entry_already_belongs_to_another_customer',
+      });
+      return null;
+    }
+    _diagnosticLog.record('capture.cache_video_acquired', fields: {
+      'customer': customer,
+      'message_at': sentAt.toUtc().toIso8601String(),
+      'source_commit': '819ce2a',
+      'original_name': cached.video.originalName,
+      'ownership_verification': cached.video.ownershipVerification,
+    });
+    return _enqueueDownloadedVideo(customer, cached.video, '',
+        sentAt: sentAt, sourceEventKey: sourceEventKey);
+  }
+
+  Future<bool> _enqueueDownloadedVideo(String customer,
+      DownloadedVideoPayload downloaded, String thumbnailFingerprint,
+      {DateTime? sentAt, String? sourceEventKey}) async {
+    final store = await _database.history;
+    final digest =
+        (await sha256.bind(File(downloaded.path).openRead()).first).toString();
+    if (await store.hasCapturedMediaEvent(customer, 'video', digest,
+        sentAt: sentAt)) {
+      _diagnosticLog.record('capture.media_event_duplicate', fields: {
+        'customer': customer,
+        'kind': 'video',
+        'content_sha256': digest,
+        'message_at': sentAt?.toUtc().toIso8601String()
+      });
+      return false;
+    }
+    final queue = await _videoCaptureQueue;
+    final job = VideoCaptureJob(
+        customer: customer,
+        path: downloaded.path,
+        digest: digest,
+        sentAt: sentAt,
+        fingerprint: thumbnailFingerprint,
+        ownershipVerification: downloaded.ownershipVerification,
+        mimeType: downloaded.mimeType,
+        originalName: downloaded.originalName,
+        sourceEventKey: sourceEventKey);
+    final enqueued = await queue.enqueue(job);
+    if (!enqueued) return false;
+    _mediaEvidenceVersions.record(
+        customer, job.messageId, MediaEvidenceStage.original,
+        sentAt: job.sentAt);
+    _diagnosticLog.record('capture.video_job_queued', fields: {
+      'customer': customer,
+      'content_sha256': digest,
+      'message_at': sentAt?.toUtc().toIso8601String()
+    });
+    return true;
+  }
+
+  Future<void> _completeVideoCaptureJob(VideoCaptureJob job) async {
+    if (!mounted) throw StateError('App closed; retain durable video job.');
+    final store = await _database.history;
+    final ownRoot = Directory(
+        '${store.mediaDirectory.path}/${store.safeUserId(job.customer)}');
+    final original = File(job.path);
+    final ownerPath = await ownRoot.resolveSymbolicLinks();
+    final actualPath = await original.resolveSymbolicLinks();
+    if (!actualPath.startsWith('$ownerPath/')) {
+      throw StateError(
+          'Queued video is outside this customer’s private directory.');
+    }
+    final digest = (await sha256.bind(original.openRead()).first).toString();
+    if (digest != job.digest) {
+      throw StateError('Queued video content hash changed.');
+    }
+    if (await store.hasCapturedMediaEvent(job.customer, 'video', digest,
+        sentAt: job.sentAt)) {
+      final document = await store.read(job.customer);
+      final partial = (document?['messages'] as List<Object?>? ?? const [])
+          .whereType<Map>()
+          .where((m) => m['id'] == job.messageId)
+          .any((m) => (m['media'] as List<Object?>? ?? const [])
+              .whereType<Map>()
+              .any((media) =>
+                  media['type'] == 'video' && media['is_partial'] == true));
+      if (partial) {
+        await store.recordMediaCaptureFailure(job.customer, 'video',
+            sentAt: job.sentAt, reason: 'video_analysis_failed');
+      }
+      return;
+    }
+    CapturedMessage? message;
+    String? failure;
+    try {
+      message = await _processDownloadedVideo(
+          job.customer,
+          DownloadedVideoPayload(
+              path: job.path,
+              mimeType: job.mimeType,
+              ownershipVerification: job.ownershipVerification,
+              originalName: job.originalName ?? 'customer-video.mp4'),
+          job.fingerprint,
+          sentAt: job.sentAt,
+          sourceEventKey: job.sourceEventKey);
+    } catch (error) {
+      failure = error.toString();
+      _diagnosticLog.record('capture.video_processing_failed', fields: {
+        'customer': job.customer,
+        'message_at': job.sentAt?.toUtc().toIso8601String(),
+        'content_sha256': digest,
+        'error': failure
+      });
+      // Preserve the original and its event even if decoding fails. Codex is
+      // explicitly told it has no readable frames; do not reuse an older clip.
+      message = CapturedMessage(
+          stableId: job.messageId,
+          direction: 'incoming',
+          body:
+              '[Customer sent a video; original saved, but video analysis failed. No readable frames are available.]',
+          sender: job.customer,
+          sentAt: job.sentAt,
+          axPath: 'ocr:jd-video-cache',
+          media: [
+            CapturedMedia(
+                type: 'video',
+                path: job.path,
+                mimeType: job.mimeType,
+                originalName: job.originalName,
+                captureSource: 'jd_video_cache',
+                sourceEventKey: job.sourceEventKey,
+                isPartial: true,
+                description:
+                    'Video analysis unavailable; do not describe its contents.',
+                visualFingerprint: job.fingerprint,
+                contentSha256: digest,
+                verifiedCustomerId: job.customer,
+                ownershipVerification: job.ownershipVerification)
+          ]);
+    }
+    if (message == null) return;
+    final capture = CapturedConversation(
+        stableKey: 'customer:${sha256.convert(utf8.encode(job.customer))}',
+        customerName: job.customer,
+        customerExternalId: job.customer,
+        verifiedCustomerId: job.customer,
+        messages: [message],
+        capturedAt: DateTime.now());
+    final inserted = await _database.saveCapture(capture);
+    if (inserted > 0) {
+      _mediaEvidenceVersions.record(
+          job.customer, message.stableId, MediaEvidenceStage.ready,
+          sentAt: message.sentAt);
+    }
+    if (failure != null) {
+      await store.recordMediaCaptureFailure(job.customer, 'video',
+          sentAt: job.sentAt, reason: 'video_analysis_failed');
+    }
+    final recovery = _unreadRecovery[job.customer];
+    if (recovery != null &&
+        recovery.acceptsIncoming(message.stableId,
+            sentAt: message.sentAt, capturedAt: capture.capturedAt)) {
+      if (recovery.holdingSentAt case final at?) {
+        await _database.acknowledgeUncapturedHolding(
+            userId: job.customer, sentAt: at);
+      }
+      _finishUnreadRecovery(job.customer, expectedRecovery: recovery);
+    }
+    await _coordinator.refresh();
   }
 
   Future<CapturedMessage?> _processDownloadedVideo(
@@ -2622,27 +3913,41 @@ class _CaptureHomeState extends State<CaptureHome> {
     DownloadedVideoPayload downloaded,
     String thumbnailFingerprint, {
     DateTime? sentAt,
-    _RunVideoProcessingUnlocked? runVideoProcessingUnlocked,
+    String? sourceEventKey,
   }) async {
+    final ownership = downloaded.ownershipVerification;
     Future<CapturedMessage?> processDownloadedVideo() async {
+      final contentDigest =
+          (await sha256.bind(File(downloaded.path).openRead()).first)
+              .toString();
+      if (await (await _database.history).hasCapturedMediaEvent(
+          customer, 'video', contentDigest,
+          sentAt: sentAt)) {
+        _diagnosticLog.record('capture.media_event_duplicate', fields: {
+          'customer': customer,
+          'kind': 'video',
+          'message_at': sentAt?.toUtc().toIso8601String(),
+          'content_sha256': contentDigest,
+        });
+        return null;
+      }
       final extracted =
           await const VideoFrameExtractor().extract(downloaded.path);
-      var audioEvidence = '[Video audio: analysis unavailable]';
       CapturedMedia? audioMedia;
       try {
         final audio =
             await const VideoAudioExtractor().extract(downloaded.path);
         if (!audio.hasAudioStream) {
-          audioEvidence = '[Video audio: no audio stream]';
+          // Visual evidence still proceeds without an audio stream.
         } else if (!audio.hasAudibleContent) {
-          audioEvidence =
-              '[Video audio: an audio stream exists, but no meaningful audible content was detected]';
           audioMedia = CapturedMedia(
             type: 'audio',
             path: audio.audioPath!,
             mimeType: 'audio/wav',
             originalName: 'video_audio.wav',
             captureSource: 'jd_video_audio_ffmpeg',
+            verifiedCustomerId: customer,
+            ownershipVerification: ownership,
             description:
                 'Audio stream present; meaningful sound was not detected.',
           );
@@ -2651,7 +3956,7 @@ class _CaptureHomeState extends State<CaptureHome> {
           try {
             speech = await _adapter
                 .transcribeAudio(audio.audioPath!)
-                .timeout(const Duration(seconds: 60));
+                .timeout(const Duration(seconds: 15));
           } catch (_) {
             // Audio evidence remains useful even if permission, connectivity, or
             // the platform recognizer is temporarily unavailable.
@@ -2662,26 +3967,29 @@ class _CaptureHomeState extends State<CaptureHome> {
             final bounded = transcript.length <= 8000
                 ? transcript
                 : '${transcript.substring(0, 8000)}…';
-            audioEvidence =
-                '[Video speech transcript (${speech!.language}): $bounded]';
             audioMedia = CapturedMedia(
               type: 'audio',
               path: audio.audioPath!,
               mimeType: 'audio/wav',
               originalName: 'video_audio.wav',
               captureSource: 'jd_video_audio_ffmpeg',
+              verifiedCustomerId: customer,
+              ownershipVerification: ownership,
+              speechTranscript: bounded,
+              speechLanguage: speech!.language,
+              speechConfidence: speech.confidence,
               description:
                   'Audible speech transcribed as ${speech.language} with confidence ${speech.confidence.toStringAsFixed(2)}: $bounded',
             );
           } else {
-            audioEvidence =
-                '[Video audio: audible content exists, but no speech was recognized]';
             audioMedia = CapturedMedia(
               type: 'audio',
               path: audio.audioPath!,
               mimeType: 'audio/wav',
               originalName: 'video_audio.wav',
               captureSource: 'jd_video_audio_ffmpeg',
+              verifiedCustomerId: customer,
+              ownershipVerification: ownership,
               description:
                   'Audible content detected; no speech transcript was available.',
             );
@@ -2701,14 +4009,14 @@ class _CaptureHomeState extends State<CaptureHome> {
               'video_frame_${(index + 1).toString().padLeft(2, '0')}s.jpg',
           captureSource: 'jd_video_frame_1fps',
           description: 'Pending Codex visual analysis.',
+          verifiedCustomerId: customer,
+          ownershipVerification: ownership,
         ));
       }
       return CapturedMessage(
-        stableId: _visibleMediaStableId(
-            'visible-video', extracted.sha256Digest, sentAt),
+        stableId: mediaMessageStableId('video', extracted.sha256Digest, sentAt),
         direction: 'incoming',
-        body:
-            '[Customer sent a video; copied from JD cache and sampled at one frame per second, maximum 20 frames]\n$audioEvidence',
+        body: '[Customer sent a video]',
         sender: customer,
         sentAt: sentAt,
         axPath: 'ocr:jd-video-cache',
@@ -2719,9 +4027,13 @@ class _CaptureHomeState extends State<CaptureHome> {
             mimeType: downloaded.mimeType,
             originalName: downloaded.originalName,
             captureSource: 'jd_video_cache',
+            sourceEventKey: sourceEventKey,
             description:
                 'Original customer video; visual evidence is stored in the sampled frame images.',
             visualFingerprint: thumbnailFingerprint,
+            contentSha256: extracted.sha256Digest,
+            verifiedCustomerId: customer,
+            ownershipVerification: ownership,
           ),
           if (audioMedia != null) audioMedia,
           ...frameMedia,
@@ -2729,15 +4041,7 @@ class _CaptureHomeState extends State<CaptureHome> {
       );
     }
 
-    final recovery = _unreadRecovery[customer];
-    if (recovery != null) recovery.videoProcessing = true;
-    try {
-      return runVideoProcessingUnlocked == null
-          ? await processDownloadedVideo()
-          : await runVideoProcessingUnlocked(processDownloadedVideo);
-    } finally {
-      if (recovery != null) recovery.videoProcessing = false;
-    }
+    return processDownloadedVideo();
   }
 
   Future<CapturedMessage?> _saveVisibleImage(
@@ -2748,15 +4052,30 @@ class _CaptureHomeState extends State<CaptureHome> {
     bool originalDownload = false,
     bool clipboardCopy = false,
     bool cacheCopy = false,
+    String? sourceEventKey,
+    bool attachmentPreview = false,
   }) async {
     final bytes = image.bytes!;
     final fingerprint = image.visualFingerprint ?? '';
-    if (fingerprint.isNotEmpty &&
-        await (await _database.history).hasSimilarImageFingerprint(
-          customer,
-          fingerprint,
-          capturedAfter: sentAt,
-        )) {
+    final digest = sha256.convert(bytes).toString();
+    final previewId = attachmentPreview && sourceEventKey != null
+        ? 'visible-attachment-preview:${sha256.convert(utf8.encode('$customer:$sourceEventKey'))}'
+        : null;
+    if (attachmentPreview &&
+        sourceEventKey != null &&
+        await (await _database.history).hasAcquiredImageEvent(
+            customer, sourceEventKey,
+            previewId: previewId)) {
+      return null;
+    }
+    if (await (await _database.history)
+        .hasCapturedMediaEvent(customer, 'image', digest, sentAt: sentAt)) {
+      _diagnosticLog.record('capture.media_event_duplicate', fields: {
+        'customer': customer,
+        'kind': 'image',
+        'message_at': sentAt?.toUtc().toIso8601String(),
+        'content_sha256': digest,
+      });
       return null;
     }
     final extension = image.extension ?? 'png';
@@ -2767,17 +4086,18 @@ class _CaptureHomeState extends State<CaptureHome> {
       filename: originalName,
       bytes: bytes,
     );
-    final digest = sha256.convert(bytes).toString();
     return CapturedMessage(
-      stableId: _visibleMediaStableId('visible-image', digest, sentAt),
+      stableId: previewId ?? mediaMessageStableId('image', digest, sentAt),
       direction: 'incoming',
-      body: clipboardCopy
-          ? '[Customer sent an image; copied from JD]'
-          : cacheCopy
-              ? '[Customer sent an image; original copied from JD cache]'
-              : originalDownload
-                  ? '[Customer sent an image; original downloaded]'
-                  : '[Customer sent an image; visible portion captured]',
+      body: attachmentPreview
+          ? '[Customer sent an attachment; visible preview captured, original not verified]'
+          : clipboardCopy
+              ? '[Customer sent an image; copied from JD]'
+              : cacheCopy
+                  ? '[Customer sent an image; original copied from JD cache]'
+                  : originalDownload
+                      ? '[Customer sent an image; original downloaded]'
+                      : '[Customer sent an image; visible portion captured]',
       sender: customer,
       sentAt: sentAt,
       axPath: clipboardCopy
@@ -2799,20 +4119,25 @@ class _CaptureHomeState extends State<CaptureHome> {
                   ? 'jd_image_cache'
                   : originalDownload
                       ? 'jd_image_viewer_download'
-                      : viewportFallback
-                          ? 'verified_chat_viewport_fallback'
-                          : 'verified_window_crop',
+                      : attachmentPreview
+                          ? 'verified_attachment_preview'
+                          : viewportFallback
+                              ? 'verified_chat_viewport_fallback'
+                              : 'verified_window_crop',
           isPartial: !originalDownload && !clipboardCopy && !cacheCopy,
-          description: 'Pending Codex visual analysis.',
+          sourceEventKey: sourceEventKey,
+          description: attachmentPreview
+              ? 'Verified visible attachment preview only. Original file/type is unverified; '
+                  'it may be an image or a video poster. Describe only visible pixels, '
+                  'not unseen video actions. White/grey/black content is valid evidence.'
+              : 'Pending Codex visual analysis.',
           visualFingerprint: fingerprint,
+          contentSha256: digest,
+          verifiedCustomerId: customer,
+          ownershipVerification: image.ownershipVerification,
         ),
       ],
     );
-  }
-
-  String _visibleMediaStableId(String prefix, String digest, DateTime? turnAt) {
-    if (turnAt == null) return '$prefix:$digest';
-    return '$prefix:$digest:${turnAt.toUtc().microsecondsSinceEpoch}';
   }
 
   Future<void> _inspect() async {
@@ -2826,6 +4151,10 @@ class _CaptureHomeState extends State<CaptureHome> {
 
   @override
   void dispose() {
+    if (Platform.isMacOS) {
+      _uiScheduler.close();
+      unawaited(_attachmentDownloads.then((queue) => queue.close()));
+    }
     _permissionMonitor?.dispose();
     // The lease is held until this controller closes, including while paused,
     // so an in-flight native operation cannot race another app's controller.
@@ -2854,6 +4183,7 @@ class _CaptureHomeState extends State<CaptureHome> {
     _updateSubscription?.cancel();
     _diagnosticSubscription?.cancel();
     _failedSendInspectionSubscription?.cancel();
+    unawaited(_videoCaptureQueue.then((queue) => queue.close()));
     _adapter.close();
     _database.close();
     super.dispose();

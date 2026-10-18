@@ -7,6 +7,11 @@ class LocalReplyRouter {
 
   static const jdOnlyChinese = '本客服账号仅处理京东店铺及京东订单。请问您的京东订单或产品需要什么帮助？';
 
+  static bool isSocialCheckIn(String text) => RegExp(
+          r'^(?:(?:hi|hello|hey)[,，!！\s]*)?(?:how are you(?: doing)?(?: today)?|how(?:\x27s| is) it going|你好吗|最近怎么样)[?？!！.。\s]*(?:复制)?$',
+          caseSensitive: false)
+      .hasMatch(text.trim());
+
   static const _greetings = <String>{
     'hi',
     'hii',
@@ -57,11 +62,13 @@ class LocalReplyRouter {
     final isIdentityQuestion = _isIdentityQuestion(body);
     final isGreeting = _greetings.contains(normalized);
     final isThanks = _thanks.contains(normalized);
+    final isSocial = isSocialCheckIn(body);
     if (!isTransfer &&
         !isUnsupportedPlatform &&
         !isIdentityQuestion &&
         !isGreeting &&
-        !isThanks) {
+        !isThanks &&
+        !isSocial) {
       return null;
     }
     // A deterministic greeting is appropriate only for the first customer
@@ -103,29 +110,33 @@ class LocalReplyRouter {
       return null;
     }
 
-    final reply = isUnsupportedPlatform
-        ? jdOnlyChinese
-        : isIdentityQuestion
-            ? '我是京东店铺的客服人员，请问有什么可以帮您？'
-            : isTransfer
-                ? transferWelcome
-                : isThanks
-                    ? '不客气，很高兴能帮到您！'
-                    : transferWelcome;
+    final reply = isSocial
+        ? '我很好，感谢您的关心！请问今天有什么可以帮您？'
+        : isUnsupportedPlatform
+            ? jdOnlyChinese
+            : isIdentityQuestion
+                ? '我是京东店铺的客服人员，请问有什么可以帮您？'
+                : isTransfer
+                    ? transferWelcome
+                    : isThanks
+                        ? '不客气，很高兴能帮到您！'
+                        : transferWelcome;
     final response = <String, Object?>{
       'reply': reply,
       'decision': 'draft',
       'confidence': 0.99,
       'used_record_ids': [
-        isUnsupportedPlatform
-            ? 'scope:jd_store_only'
-            : isIdentityQuestion
-                ? 'identity:customer_service_agent'
-                : isTransfer
-                    ? 'intent:transfer_welcome'
-                    : isThanks
-                        ? 'intent:thanks'
-                        : 'intent:greeting'
+        isSocial
+            ? 'intent:social_check_in'
+            : isUnsupportedPlatform
+                ? 'scope:jd_store_only'
+                : isIdentityQuestion
+                    ? 'identity:customer_service_agent'
+                    : isTransfer
+                        ? 'intent:transfer_welcome'
+                        : isThanks
+                            ? 'intent:thanks'
+                            : 'intent:greeting'
       ],
       'required_slots': <String>[],
       'actions': <Object?>[],

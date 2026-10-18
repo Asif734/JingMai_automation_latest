@@ -6,7 +6,7 @@ import 'package:jd_automation/storage/capture_database.dart';
 import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 
 void main() {
-  test('same customer image in a later turn is stored again', () async {
+  test('same image resent at a new JD timestamp creates new work', () async {
     final root = await Directory.systemTemp.createTemp('repeated_image_test_');
     final database = CaptureDatabase(storageRoot: root);
     addTearDown(() async {
@@ -52,7 +52,10 @@ void main() {
           capturedAfter: secondAt,
         ),
         isFalse);
+    expect(await store.hasCapturedMediaContent('repeat-image', 'image', digest),
+        isTrue);
     expect(await database.saveCapture(turn(secondAt)), 1);
+    expect(await database.saveCapture(turn(secondAt)), 0);
 
     final document = await store.read('repeat-image');
     final incoming = (document!['messages'] as List<Object?>)
@@ -774,6 +777,15 @@ void main() {
     );
     expect(rows.single['delivery_state'], 'transfer_only');
 
+    final ticket = await database.createHumanReviewTicket(
+        userId: userId,
+        customerRequest: 'Transfer me to another agent',
+        reason: 'explicit request',
+        requestMessageId: 'transfer-message');
+    // Production starts the handoff before the later draft cleanup. Consuming
+    // its cursor must be atomic with that first deletion.
+    await database.markTicketContacting(ticket.id);
+    expect(await database.answeredMessageId(userId), 'transfer-message');
     await database.discardTransferOnlyDraft(userId);
 
     expect(await database.hasUndeliveredDraft(userId), isFalse);
@@ -2075,11 +2087,12 @@ void main() {
       customerName: 'answered-user',
       customerExternalId: 'answered-user',
       capturedAt: DateTime.fromMillisecondsSinceEpoch(1),
-      messages: const [
+      messages: [
         CapturedMessage(
           stableId: 'incoming-1',
           direction: 'incoming',
           body: 'How can I buy this?',
+          sentAt: DateTime.fromMillisecondsSinceEpoch(1),
           axPath: 'test',
         ),
       ],
@@ -2092,17 +2105,20 @@ void main() {
       customerName: incoming.customerName,
       customerExternalId: incoming.customerExternalId,
       capturedAt: DateTime.fromMillisecondsSinceEpoch(2),
-      messages: const [
+      messages: [
         CapturedMessage(
           stableId: 'incoming-1',
           direction: 'incoming',
           body: 'How can I buy this?',
+          sentAt: DateTime.fromMillisecondsSinceEpoch(1),
           axPath: 'test',
         ),
         CapturedMessage(
           stableId: 'outgoing-1',
           direction: 'outgoing',
           body: 'I will send the purchase link.',
+          sentAt: DateTime.fromMillisecondsSinceEpoch(2),
+          deliveryConfirmed: true,
           axPath: 'test',
         ),
       ],

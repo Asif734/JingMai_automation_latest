@@ -51,8 +51,32 @@ void main() {
     expect(batch.map((message) => message['id']), ['model', 'question']);
   });
 
+  test('old refund batch ends at handoff before a new-session greeting', () {
+    final batch = customerBatchThroughMessage([
+      {'id': 'older', 'direction': 'incoming', 'body': 'printer not working'},
+      {'id': 'refund', 'direction': 'incoming', 'body': 'I want a refund'},
+      {
+        'id': 'handoff',
+        'direction': 'outgoing',
+        'sender': 'jd-transfer-acknowledgement-v1'
+      },
+      {
+        'id': 'welcome',
+        'direction': 'outgoing',
+        'sender': 'jd-transfer-welcome-v1'
+      },
+      {'id': 'today', 'direction': 'incoming', 'body': 'how are you doing? 复制'},
+    ], endMessageId: 'today', answeredMessageId: 'older');
+    expect(batch.map((message) => message['id']), ['today']);
+    final social = const LocalReplyRouter().route(batch);
+    expect(social, isNotNull);
+    expect(draftRequiresHumanReview(social!), isFalse);
+    expect(social.usedRecordIds, ['intent:social_check_in']);
+  });
+
   test('creates a durable read-only session with structured output', () {
-    expect(service.timeout, const Duration(seconds: 90));
+    expect(service.timeout, const Duration(seconds: 100));
+    expect(service.videoReportTimeout, const Duration(minutes: 2));
     final arguments = service.buildArguments(
       outputPath: '${root.path}/reply.json',
       imagePaths: const ['/tmp/customer image.png'],
@@ -164,7 +188,9 @@ void main() {
     );
 
     expect(draft.model, 'local-timeout-fallback-v2');
-    expect(draft.reply, contains('进一步准确核对'));
+    expect(draft.reply,
+        anyOf(contains('进一步核对'), contains('进一步确认'), contains('继续确认')));
+    expect(draft.reply, anyOf(contains('已保留'), contains('保留')));
     expect(draft.reply, isNot(contains('senior customer service agent')));
     expect(draft.reply, isNot(contains('forwarded')));
     expect(draft.decision, 'human_review_required');
@@ -192,6 +218,38 @@ void main() {
     expect(draft.reply, contains('您好'));
     expect(draft.confidence, 0.98);
     expect(draft.model, 'gpt-6.1-sol');
+  });
+
+  test('knowledge grounding accepts only supplied record ids', () {
+    final grounded = service.parseResponse('''{
+      "reply": "Verified answer",
+      "decision": "draft",
+      "confidence": 0.98,
+      "used_record_ids": ["record_a"],
+      "required_slots": [],
+      "actions": [],
+      "risk_level": "low",
+      "risk_triggers": [],
+      "auto_send_allowed": false,
+      "attachments": [],
+      "human_review_required": false
+    }''');
+    expect(draftUsesOnlyApprovedKnowledge(grounded, {'record_a'}), isTrue);
+    expect(draftUsesOnlyApprovedKnowledge(grounded, {'record_b'}), isFalse);
+    final uncited = service.parseResponse('''{
+      "reply": "Unsupported answer",
+      "decision": "draft",
+      "confidence": 0.98,
+      "used_record_ids": [],
+      "required_slots": [],
+      "actions": [],
+      "risk_level": "low",
+      "risk_triggers": [],
+      "auto_send_allowed": false,
+      "attachments": [],
+      "human_review_required": false
+    }''');
+    expect(draftUsesOnlyApprovedKnowledge(uncited, {'record_a'}), isFalse);
   });
 
   test('records the model actually selected for a fallback reply', () {
@@ -471,7 +529,8 @@ void main() {
     expect(draftRequiresHumanReview(guarded), isTrue);
     expect(guarded.decision, 'human_review_required');
     expect(guarded.riskLevel, 'high');
-    expect(guarded.reply, contains('进一步准确核对'));
+    expect(guarded.reply,
+        anyOf(contains('进一步核对'), contains('进一步确认'), contains('继续确认')));
     expect(guarded.reply, isNot(contains('senior customer service agent')));
     expect(guarded.reply, isNot(contains('forwarded')));
   });
@@ -502,7 +561,8 @@ void main() {
 
     expect(draftRequiresHumanReview(guarded), isTrue);
     expect(guarded.decision, 'human_review_required');
-    expect(guarded.reply, contains('进一步准确核对'));
+    expect(guarded.reply,
+        anyOf(contains('进一步核对'), contains('进一步确认'), contains('继续确认')));
   });
 
   test('recognizes refund and video-guide requests', () {
@@ -1346,9 +1406,11 @@ void main() {
         '{"id":"chunk_orbit","type":"source_chunk","source_file":"source.md","content":"orbitchunktoken"}\n');
     await File('${knowledge.path}/first_kb.md')
         .writeAsString('# First\n\nzirconmarkdownone');
-    final nestedMarkdownFile = File('${knowledge.path}/docs/plan.md');
-    await nestedMarkdownFile.create(recursive: true);
-    await nestedMarkdownFile.writeAsString('# Second\n\nquasarmarkdowntwo');
+    final nestedPlanningFile = File('${knowledge.path}/docs/plan.md');
+    await nestedPlanningFile.create(recursive: true);
+    await nestedPlanningFile.writeAsString('# Planning\n\nquasarmarkdowntwo');
+    final nestedKnowledgeFile = File('${knowledge.path}/docs/second_kb.md');
+    await nestedKnowledgeFile.writeAsString('# Second\n\nnebulaknowledgetoken');
 
     final retriever = LocalKnowledgeRetriever(knowledge);
     final card = await retriever.retrieve('zephyrcardtoken', limit: 1);
@@ -1357,6 +1419,8 @@ void main() {
         await retriever.retrieve('zirconmarkdownone', limit: 1);
     final nestedMarkdown =
         await retriever.retrieve('quasarmarkdowntwo', limit: 1);
+    final nestedKnowledge =
+        await retriever.retrieve('nebulaknowledgetoken', limit: 1);
 
     expect(card.single['id'], 'card_zephyr');
     expect(sourceChunk.single['id'], 'chunk_orbit');
@@ -1366,6 +1430,7 @@ void main() {
       nestedMarkdown.any((record) => record['source_file'] == 'docs/plan.md'),
       isFalse,
     );
+    expect(nestedKnowledge.single['source_file'], 'docs/second_kb.md');
   });
 
   test('retrieval omits non-JD marketplace evidence', () async {
@@ -1426,6 +1491,40 @@ void main() {
 
     expect(lexical.map((record) => record['id']), ['card_a', 'card_b']);
     expect(hybrid.map((record) => record['id']), ['card_b', 'card_a']);
+  });
+
+  test('semantic similarity can rescue a reviewed card without lexical overlap',
+      () async {
+    final knowledge = Directory('${root.path}/semantic_recall_knowledge');
+    final ragCards = Directory('${knowledge.path}/rag_cards');
+    await ragCards.create(recursive: true);
+    await File('${ragCards.path}/customer_service_rag_cards.jsonl').writeAsString(
+        '{"id":"semantic_answer","status":"active","issue":"完全不同措辞","reply_template":"verified answer"}\n');
+
+    final records = await LocalKnowledgeRetriever(knowledge,
+            semanticScorer:
+                _FixedSemanticScorer(const {'semantic_answer': 0.91}))
+        .retrieve('customer wording with no shared token', limit: 2);
+
+    expect(records.map((record) => record['id']), contains('semantic_answer'));
+  });
+
+  test('exact model queries retain applicable generic family guidance',
+      () async {
+    final knowledge = Directory('${root.path}/generic_family_knowledge');
+    final ragCards = Directory('${knowledge.path}/rag_cards');
+    await ragCards.create(recursive: true);
+    await File('${ragCards.path}/customer_service_rag_cards.jsonl').writeAsString(
+        '{"id":"generic_driver","status":"active","models":["热敏打印机"],"keywords":["驱动","安装"],"issue":"Windows热敏打印机驱动安装","reply_template":"Use the verified Windows installer."}\n'
+        '{"id":"wrong_model","status":"active","models":["TP999"],"keywords":["驱动","安装"],"issue":"different model"}\n');
+
+    final records = await LocalKnowledgeRetriever(knowledge,
+            semanticScorer: _FixedSemanticScorer(const {}))
+        .retrieve('TP730 driver installation', limit: 5);
+
+    expect(records.map((record) => record['id']), contains('generic_driver'));
+    expect(
+        records.map((record) => record['id']), isNot(contains('wrong_model')));
   });
 
   test('semantic scorer maps an English thermal model list to Chinese terms',

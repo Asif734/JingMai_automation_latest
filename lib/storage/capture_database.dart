@@ -6,21 +6,28 @@ import 'package:path_provider/path_provider.dart';
 import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 
 import '../domain/capture_models.dart';
+import '../capture/reply_message_scope.dart';
 import '../runtime/app_runtime.dart';
 import 'conversation_file_store.dart';
+import 'resilient_database.dart';
 
 /// SQLite contains the durable processing, delivery, and SLA state. Messages
 /// and confirmed sent replies live in per-user JSON documents managed by
 /// [history]. Unsent generated drafts remain outside conversation history.
 class CaptureDatabase {
-  CaptureDatabase({Directory? storageRoot}) : _storageRoot = storageRoot;
+  CaptureDatabase({Directory? storageRoot, this.onDatabaseRecovery})
+      : _storageRoot = storageRoot;
+
+  final void Function(Object error, int attempt)? onDatabaseRecovery;
 
   final Directory? _storageRoot;
-  Database? _database;
-  Future<Database>? _databaseOpening;
+  ResilientDatabase? _database;
+  Future<ResilientDatabase>? _databaseOpening;
   ConversationFileStore? _history;
   bool _legacyDraftsPurged = false;
   bool _reviewControlsSynced = false;
+  final Set<String> _pendingCaptureRepairs = {};
+  bool _scannedRecentHistoryForRepair = false;
   static const slaFallbackDelay = Duration(seconds: 20);
 
   Future<Directory> get storageRoot async =>
@@ -33,21 +40,47 @@ class CaptureDatabase {
     return value;
   }
 
-  Future<Database> get database => _databaseOpening ??= _openDatabase();
+  Future<ResilientDatabase> get database async {
+    final opening = _databaseOpening ??= _openDatabase();
+    try {
+      return await opening;
+    } catch (_) {
+      if (identical(_databaseOpening, opening)) {
+        final failed = _database;
+        _database = null;
+        await failed?.close();
+        _databaseOpening = null;
+      }
+      rethrow;
+    }
+  }
 
-  Future<Database> _openDatabase() async {
+  Future<ResilientDatabase> _openDatabase() async {
     if (_database case final database?) return database;
     sqfliteFfiInit();
-    final database = await databaseFactoryFfi.openDatabase(
-      p.join((await storageRoot).path, 'jd_automation.sqlite3'),
-      options: OpenDatabaseOptions(
-        // The withdrawn connectivity build already opened some stores at v14.
-        // Keep compatibility; no new tables/columns or delivery policy here.
-        version: 14,
-        onCreate: _create,
-        onUpgrade: _upgrade,
-      ),
-    );
+    final databasePath =
+        p.join((await storageRoot).path, 'jd_automation.sqlite3');
+    final database = ResilientDatabase(() async {
+      return databaseFactoryFfi.openDatabase(
+        databasePath,
+        options: OpenDatabaseOptions(
+          singleInstance: false,
+          onConfigure: (db) async {
+            // Readers, including operator diagnostics, must not obstruct a
+            // writer's COMMIT. A real competing writer waits briefly and then
+            // yields to the application recovery/retry path.
+            await db.execute('PRAGMA busy_timeout=750');
+            await db.rawQuery('PRAGMA journal_mode=WAL');
+            await db.execute('PRAGMA synchronous=FULL');
+          },
+          // The withdrawn connectivity build already opened some stores at v14.
+          // Keep compatibility; no new tables/columns or delivery policy here.
+          version: 14,
+          onCreate: _create,
+          onUpgrade: _upgrade,
+        ),
+      );
+    }, onRecovery: onDatabaseRecovery);
     _database = database;
     // Repair every legacy delivery freeze into serial retry work. A generated
     // reply must never remain outside the delivery queue indefinitely.
@@ -222,6 +255,7 @@ class CaptureDatabase {
     required String userId,
     required String eventKey,
     DateTime? now,
+    Duration minimumInterval = Duration.zero,
   }) async {
     final db = await database;
     final timestamp = (now ?? DateTime.now()).millisecondsSinceEpoch;
@@ -234,6 +268,14 @@ class CaptureDatabase {
         limit: 1,
       );
       if (existing.isNotEmpty) return false;
+      if (minimumInterval > Duration.zero) {
+        final recent = await txn.query('transfer_welcomes',
+            columns: ['user_id'],
+            where: 'user_id = ? AND created_at_ms >= ?',
+            whereArgs: [userId, timestamp - minimumInterval.inMilliseconds],
+            limit: 1);
+        if (recent.isNotEmpty) return false;
+      }
       await txn.insert(
         'transfer_welcomes',
         {
@@ -433,6 +475,25 @@ class CaptureDatabase {
 
   Future<int> saveCapture(CapturedConversation capture,
       {bool isCurrentViewport = true}) async {
+    final userId = capture.customerExternalId ?? capture.customerName;
+    try {
+      final changed =
+          await _saveCapture(capture, isCurrentViewport: isCurrentViewport);
+      if (_pendingCaptureRepairs.contains(userId)) {
+        await ensurePendingForUnanswered(userId);
+      }
+      _pendingCaptureRepairs.remove(userId);
+      return changed;
+    } catch (error) {
+      if (ResilientDatabase.isContention(error)) {
+        _pendingCaptureRepairs.add(userId);
+      }
+      rethrow;
+    }
+  }
+
+  Future<int> _saveCapture(CapturedConversation capture,
+      {required bool isCurrentViewport}) async {
     final store = await history;
     final result = await store.appendCapture(capture);
     final userId = capture.customerExternalId ?? capture.customerName;
@@ -474,6 +535,21 @@ class CaptureDatabase {
               message['direction'] == 'outgoing' &&
               insertedOutgoingIds.contains(message['id']?.toString()))
           .firstOrNull;
+      // OCR text is only an observation. A timestamp, positive receipt and
+      // matching unanswered batch are required before it may complete work.
+      // In particular, a number read inside a video must not delete a draft.
+      if (lastInsertedOutgoing == null ||
+          !isConfirmedOutgoingReply(lastInsertedOutgoing) ||
+          (lastIncoming != null &&
+              !replyAnswersIncoming(
+                  reply: lastInsertedOutgoing,
+                  incomingId: lastIncoming['id']?.toString() ?? '',
+                  messages: messages))) {
+        if (result.insertedIncomingIds.isNotEmpty) {
+          await _upsertPending(capture, store);
+        }
+        return result.changed;
+      }
       // Seeing our own failed/pending bubble is not a manual seller answer.
       // Keep its uncertain draft until a positive receipt reconciles it.
       final uncertain = await db.query('generated_drafts',
@@ -484,7 +560,6 @@ class CaptureDatabase {
           whereArgs: [userId],
           limit: 1);
       if (uncertain.isNotEmpty &&
-          lastInsertedOutgoing != null &&
           lastInsertedOutgoing['body']
                   ?.toString()
                   .replaceAll(RegExp(r'\s+'), '') ==
@@ -506,7 +581,7 @@ class CaptureDatabase {
       final incomingSentAt =
           DateTime.tryParse(lastIncoming?['sent_at']?.toString() ?? '');
       final outgoingSentAt =
-          DateTime.tryParse(lastInsertedOutgoing?['sent_at']?.toString() ?? '');
+          DateTime.tryParse(lastInsertedOutgoing['sent_at']?.toString() ?? '');
       final outgoingPredatesLatestIncoming = incomingSentAt != null &&
           outgoingSentAt != null &&
           outgoingSentAt.isBefore(incomingSentAt);
@@ -601,6 +676,8 @@ class CaptureDatabase {
         await txn.update('sla_fallbacks', {'state': 'completed'},
             where: "user_id = ? AND state = 'sent'", whereArgs: [userId]);
       }
+      final freshDue = await _resetSentHoldingForNewEvent(
+          txn, userId, DateTime.tryParse(newest['sent_at']?.toString() ?? ''));
       await txn.rawInsert('''INSERT INTO pending_customers(
         user_id, display_name, stable_key, newest_message_id, enqueued_at_ms, updated_at_ms)
         VALUES(?, ?, ?, ?, ?, ?)
@@ -621,7 +698,7 @@ class CaptureDatabase {
         VALUES(?,?,?,'pending',NULL,?)
         ON CONFLICT(user_id) DO UPDATE SET
           message_id=CASE
-            WHEN sla_fallbacks.state='sending' THEN sla_fallbacks.message_id
+            WHEN sla_fallbacks.state IN ('sending','sent') THEN sla_fallbacks.message_id
             ELSE excluded.message_id END,
           due_at_ms=CASE
             WHEN sla_fallbacks.state IN ('pending','sending','reserved','sent')
@@ -638,7 +715,9 @@ class CaptureDatabase {
           updated_at_ms=excluded.updated_at_ms''', [
         userId,
         newestId,
-        slaStartedAt.millisecondsSinceEpoch + slaFallbackDelay.inMilliseconds,
+        freshDue ??
+            _holdingWindowDue(messages, capture.capturedAt,
+                slaStartedAt.add(slaFallbackDelay)),
         now,
       ]);
     });
@@ -695,7 +774,7 @@ class CaptureDatabase {
         where: 'user_id = ?',
         whereArgs: [userId],
         limit: 1);
-    if (controls.isNotEmpty && controls.first['state'] != 'ai_active') {
+    if (controls.isNotEmpty && controls.first['state'] == 'human_contacting') {
       return false;
     }
     final document = await (await history).read(userId);
@@ -708,6 +787,19 @@ class CaptureDatabase {
         .lastIndexWhere((message) => message['direction'] == 'incoming');
     if (incomingIndex <= boundary) return false;
     final incoming = messages[incomingIndex];
+    if (controls.isNotEmpty &&
+        controls.first['state'] == 'waiting_for_customer') {
+      // A new saved customer message resumes service even if its original
+      // queue insertion failed during a transient database lock.
+      final control = await db.query('conversation_control',
+          where: 'user_id = ?', whereArgs: [userId], limit: 1);
+      if (control.single['resume_after_message_id'] == incoming['id']) {
+        return false;
+      }
+      await db.update('conversation_control',
+          {'state': 'ai_active', 'resume_after_message_id': null},
+          where: 'user_id = ?', whereArgs: [userId]);
+    }
     final firstUnanswered = messages
         .skip(boundary + 1)
         .where((message) => message['direction'] == 'incoming')
@@ -744,6 +836,44 @@ class CaptureDatabase {
       startedAt: slaStartedAt,
     );
     return true;
+  }
+
+  /// JSON is saved before SQL. Rebuild queue work lost to a failed SQL write,
+  /// including after a process restart, without reactivating old customers.
+  Future<void> repairPendingCaptures() async {
+    final store = await history;
+    if (!_scannedRecentHistoryForRepair) {
+      await store.conversationsDirectory.create(recursive: true);
+      final cutoff = DateTime.now().toUtc().subtract(const Duration(days: 1));
+      await for (final file
+          in store.conversationsDirectory.list(followLinks: false)) {
+        if (file is! File || !file.path.endsWith('.json')) continue;
+        if ((await file.stat()).modified.toUtc().isBefore(cutoff)) continue;
+        try {
+          final document = jsonDecode(await file.readAsString());
+          if (document is! Map<String, dynamic>) continue;
+          final userId = document['user_id']?.toString();
+          final incoming = (document['messages'] as List<Object?>? ?? const [])
+              .whereType<Map<String, dynamic>>()
+              .where((message) => message['direction'] == 'incoming')
+              .lastOrNull;
+          final capturedAt =
+              DateTime.tryParse(incoming?['captured_at']?.toString() ?? '');
+          if (userId != null &&
+              capturedAt != null &&
+              !capturedAt.isBefore(cutoff)) {
+            _pendingCaptureRepairs.add(userId);
+          }
+        } on FormatException {
+          // An unrelated malformed history must not block other customers.
+        }
+      }
+      _scannedRecentHistoryForRepair = true;
+    }
+    for (final userId in _pendingCaptureRepairs.toList(growable: false)) {
+      await ensurePendingForUnanswered(userId);
+      _pendingCaptureRepairs.remove(userId);
+    }
   }
 
   Future<List<ConversationSummary>> conversations() async {
@@ -811,10 +941,62 @@ class CaptureDatabase {
     return rows.isEmpty ? null : rows.first['message_id']?.toString();
   }
 
+  /// Records a receipt already saved independently of SQLite. This never
+  /// sends a message and never consumes customer messages beyond its batch.
+  Future<void> acknowledgeOutboxReply(
+      {required String userId,
+      required String batchEndMessageId,
+      required String reply}) async {
+    final db = await database;
+    final document = await (await history).read(userId);
+    final messages = (document?['messages'] as List<Object?>? ?? const [])
+        .whereType<Map<String, dynamic>>()
+        .toList(growable: false);
+    final batchIndex =
+        messages.indexWhere((message) => message['id'] == batchEndMessageId);
+    if (batchIndex < 0) return;
+    final cursor = await answeredMessageId(userId);
+    final answeredIndex = _answeredIndex(messages, cursor);
+    await db.transaction((txn) async {
+      await txn.delete('generated_drafts',
+          where: 'user_id = ? AND batch_end_message_id = ? AND reply = ?',
+          whereArgs: [userId, batchEndMessageId, reply]);
+      if (cursor == null || batchIndex >= answeredIndex) {
+        await txn.rawInsert('''INSERT INTO answered_cursors(user_id,message_id)
+          VALUES(?,?) ON CONFLICT(user_id) DO UPDATE SET
+          message_id=excluded.message_id''', [userId, batchEndMessageId]);
+      }
+      await txn.delete('pending_customers',
+          where: 'user_id = ? AND newest_message_id = ?',
+          whereArgs: [userId, batchEndMessageId]);
+      await txn.update('sla_fallbacks', {'state': 'completed'},
+          where: 'user_id = ? AND message_id = ?',
+          whereArgs: [userId, batchEndMessageId]);
+    });
+    await ensurePendingForUnanswered(userId);
+  }
+
   int _answeredIndex(List<Map<String, dynamic>> messages, String? cursor) {
     if (cursor != null) {
       final index = messages.indexWhere((message) => message['id'] == cursor);
-      if (index >= 0) return index;
+      if (index >= 0) {
+        // A transfer welcome can precede late OCR of the customer's plain
+        // greeting. Do not generate a second greeting/SLA for that same hi.
+        // Never jump over a substantive unanswered question or attachment.
+        var boundary = index;
+        final welcomes = messages.where(isTransferWelcomeReply).toList();
+        for (var i = index + 1; i < messages.length; i++) {
+          if (messages[i]['direction'] != 'incoming') continue;
+          if (!welcomes.any((reply) => replyAnswersIncoming(
+              reply: reply,
+              incomingId: messages[i]['id']?.toString() ?? '',
+              messages: messages))) {
+            break;
+          }
+          boundary = i;
+        }
+        return boundary;
+      }
       // Older OCR versions could replace a bubble ID after it had become the
       // answered cursor. Recover from the actual sent-reply boundary instead
       // of treating the entire conversation as unanswered.
@@ -829,25 +1011,15 @@ class CaptureDatabase {
         outgoingIndex++) {
       final outgoing = messages[outgoingIndex];
       if (!_isFinalOutgoing(outgoing)) continue;
-      final outgoingSentAt =
-          DateTime.tryParse(outgoing['sent_at']?.toString() ?? '');
-      if (outgoingSentAt == null) {
-        final precedingIncoming = messages
-            .take(outgoingIndex)
-            .toList(growable: false)
-            .lastIndexWhere((message) => message['direction'] == 'incoming');
-        if (precedingIncoming > boundary) boundary = precedingIncoming;
-        continue;
-      }
       for (var incomingIndex = 0;
           incomingIndex < messages.length;
           incomingIndex++) {
         final incoming = messages[incomingIndex];
         if (incoming['direction'] != 'incoming') continue;
-        final incomingSentAt =
-            DateTime.tryParse(incoming['sent_at']?.toString() ?? '');
-        if (incomingSentAt != null &&
-            !incomingSentAt.isAfter(outgoingSentAt) &&
+        if (replyAnswersIncoming(
+                reply: outgoing,
+                incomingId: incoming['id']?.toString() ?? '',
+                messages: messages) &&
             incomingIndex > boundary) {
           boundary = incomingIndex;
         }
@@ -857,9 +1029,7 @@ class CaptureDatabase {
   }
 
   bool _isFinalOutgoing(Map<String, dynamic> message) =>
-      message['direction'] == 'outgoing' &&
-      message['source'] != 'sla_fallback' &&
-      message['delivery_status'] != 'delivery_unknown';
+      isConfirmedOutgoingReply(message);
 
   bool _newTurnAfterHoldingAndReply(List<Map<String, dynamic>> messages) {
     final holding = messages
@@ -868,6 +1038,51 @@ class CaptureDatabase {
     final incoming = messages
         .lastIndexWhere((message) => message['direction'] == 'incoming');
     return holding >= 0 && holding < reply && reply < incoming;
+  }
+
+  /// A receipt can cover only messages sent before that receipt. New genuine
+  /// events receive their own holding deadline, with a cooldown against spam.
+  /// This also repairs legacy rows whose message_id moved but sent_at did not.
+  Future<int?> _resetSentHoldingForNewEvent(
+      Transaction txn, String userId, DateTime? incomingAt) async {
+    if (incomingAt == null) return null;
+    final rows = await txn.query('sla_fallbacks',
+        where: "user_id=? AND state='sent'", whereArgs: [userId], limit: 1);
+    final sent = rows.firstOrNull?['sent_at_ms'] as int?;
+    if (sent == null || incomingAt.millisecondsSinceEpoch <= sent) return null;
+    final eventDue = incomingAt.add(slaFallbackDelay).millisecondsSinceEpoch;
+    final cooldownDue = sent + const Duration(seconds: 50).inMilliseconds;
+    await txn.update('sla_fallbacks', {'state': 'completed'},
+        where: "user_id=? AND state='sent' AND sent_at_ms=?",
+        whereArgs: [userId, sent]);
+    return eventDue > cooldownDue ? eventDue : cooldownDue;
+  }
+
+  /// Do not drag a new pending window back to an older, already acknowledged
+  /// message when more messages are appended or queue recovery runs again.
+  int _holdingWindowDue(List<Map<String, dynamic>> messages,
+      DateTime capturedAt, DateTime defaultDue) {
+    final holding = messages
+        .where((m) =>
+            m['source'] == 'sla_fallback' && m['delivery_status'] == 'sent')
+        .lastOrNull;
+    final heldAt = DateTime.tryParse(holding?['sent_at']?.toString() ?? '');
+    if (heldAt == null) return defaultDue.millisecondsSinceEpoch;
+    final next = messages
+        .skip(messages.lastIndexWhere(isConfirmedOutgoingReply) + 1)
+        .where((m) =>
+            m['direction'] == 'incoming' &&
+            (DateTime.tryParse(m['sent_at']?.toString() ?? '')
+                    ?.isAfter(heldAt) ??
+                false))
+        .firstOrNull;
+    if (next == null) return defaultDue.millisecondsSinceEpoch;
+    final eventDue = _slaStartedAt(
+            capturedAt, DateTime.tryParse(next['sent_at']?.toString() ?? ''))
+        .add(slaFallbackDelay);
+    final cooldownDue = heldAt.add(const Duration(seconds: 50));
+    return (eventDue.isAfter(cooldownDue) ? eventDue : cooldownDue)
+        .millisecondsSinceEpoch;
   }
 
   Future<void> _ensureSlaFallback({
@@ -885,12 +1100,16 @@ class CaptureDatabase {
       await db.update('sla_fallbacks', {'state': 'completed'},
           where: "user_id = ? AND state = 'sent'", whereArgs: [userId]);
     }
-    await db.rawInsert('''INSERT INTO sla_fallbacks(
+    await db.transaction((txn) async {
+      final incoming = messages.where((m) => m['id'] == messageId).firstOrNull;
+      final freshDue = await _resetSentHoldingForNewEvent(txn, userId,
+          DateTime.tryParse(incoming?['sent_at']?.toString() ?? ''));
+      await txn.rawInsert('''INSERT INTO sla_fallbacks(
       user_id,message_id,due_at_ms,state,sent_at_ms,updated_at_ms)
       VALUES(?,?,?,'pending',NULL,?)
       ON CONFLICT(user_id) DO UPDATE SET
         message_id=CASE
-          WHEN sla_fallbacks.state='sending' THEN sla_fallbacks.message_id
+          WHEN sla_fallbacks.state IN ('sending','sent') THEN sla_fallbacks.message_id
           ELSE excluded.message_id END,
         due_at_ms=CASE
           WHEN sla_fallbacks.state IN ('pending','sending','reserved','sent')
@@ -905,12 +1124,16 @@ class CaptureDatabase {
             THEN sla_fallbacks.sent_at_ms
           ELSE NULL END,
         updated_at_ms=excluded.updated_at_ms
-      WHERE sla_fallbacks.message_id != excluded.message_id''', [
-      userId,
-      messageId,
-      startedAt.millisecondsSinceEpoch + slaFallbackDelay.inMilliseconds,
-      now,
-    ]);
+      WHERE sla_fallbacks.message_id != excluded.message_id
+        OR sla_fallbacks.state IN ('completed','cancelled')''', [
+        userId,
+        messageId,
+        freshDue ??
+            _holdingWindowDue(
+                messages, DateTime.now(), startedAt.add(slaFallbackDelay)),
+        now,
+      ]);
+    });
   }
 
   Future<SlaFallbackJob?> slaFallbackJob(String userId) async {
@@ -970,6 +1193,16 @@ class CaptureDatabase {
   /// verified send as the one holding message for this response window.
   Future<void> acknowledgeUncapturedHolding(
       {required String userId, required DateTime sentAt}) async {
+    final rows = await (await database).query('sla_fallbacks',
+        where: 'user_id=?', whereArgs: [userId], limit: 1);
+    final document = await (await history).read(userId);
+    final incoming = (document?['messages'] as List<Object?>? ?? const [])
+        .whereType<Map>()
+        .where((m) => m['id'] == rows.firstOrNull?['message_id'])
+        .firstOrNull;
+    final incomingAt =
+        DateTime.tryParse(incoming?['sent_at']?.toString() ?? '');
+    if (incomingAt != null && sentAt.isBefore(incomingAt)) return;
     final now = DateTime.now().millisecondsSinceEpoch;
     await (await database).update(
       'sla_fallbacks',
@@ -978,8 +1211,13 @@ class CaptureDatabase {
         'sent_at_ms': sentAt.millisecondsSinceEpoch,
         'updated_at_ms': now,
       },
-      where: "user_id = ? AND state IN ('pending','sending')",
-      whereArgs: [userId],
+      where:
+          "user_id = ? AND message_id = ? AND due_at_ms = ? AND state IN ('pending','sending')",
+      whereArgs: [
+        userId,
+        rows.firstOrNull?['message_id'],
+        rows.firstOrNull?['due_at_ms']
+      ],
     );
   }
 
@@ -1089,6 +1327,7 @@ class CaptureDatabase {
     AiDraft draft, {
     String? expectedMessageId,
     bool deliverable = true,
+    bool onlyIfAbsent = false,
   }) async {
     final db = await database;
     final now = DateTime.now().millisecondsSinceEpoch;
@@ -1098,6 +1337,15 @@ class CaptureDatabase {
           where: 'id = ?', whereArgs: [pendingId], limit: 1);
       if (rows.isEmpty) return 0;
       final row = rows.first;
+      if (onlyIfAbsent &&
+          (await txn.query('generated_drafts',
+                  columns: ['user_id'],
+                  where: 'user_id=?',
+                  whereArgs: [row['user_id']],
+                  limit: 1))
+              .isNotEmpty) {
+        return 0;
+      }
       final newerBatchPending = expectedMessageId != null &&
           row['newest_message_id'] != expectedMessageId;
       await txn.rawInsert('''INSERT INTO generated_drafts(
@@ -1134,6 +1382,45 @@ class CaptureDatabase {
         whereArgs: [userId],
         limit: 1);
     return rows.isNotEmpty;
+  }
+
+  /// A durable ready outbox entry is proof of an unsent original, not proof
+  /// that a missing queue row means it was delivered. Rebuild bookkeeping
+  /// only for its exact customer/batch and only absent a verified final reply.
+  Future<bool> restoreUnsentOutboxDraft(
+      {required String userId,
+      required String batchEndMessageId,
+      required AiDraft draft}) async {
+    if (await isHumanContacting(userId)) return false;
+    final document = await (await history).read(userId);
+    final messages = (document?['messages'] as List<Object?>? ?? const [])
+        .whereType<Map<String, dynamic>>()
+        .toList();
+    if (!messages.any((m) =>
+            m['direction'] == 'incoming' && m['id'] == batchEndMessageId) ||
+        messages.any((m) => replyAnswersIncoming(
+            reply: m, incomingId: batchEndMessageId, messages: messages))) {
+      return false;
+    }
+    final newest = messages.lastWhere((m) => m['direction'] == 'incoming');
+    final now = DateTime.now().millisecondsSinceEpoch;
+    final db = await database;
+    await db.rawInsert('''INSERT INTO pending_customers(
+      user_id,display_name,stable_key,newest_message_id,enqueued_at_ms,updated_at_ms)
+      VALUES(?,?,?,?,?,?) ON CONFLICT(user_id) DO NOTHING''', [
+      userId,
+      document?['display_name']?.toString() ?? userId,
+      document?['stable_key']?.toString() ?? userId,
+      newest['id'],
+      now,
+      now
+    ]);
+    final rows = await db.query('pending_customers',
+        columns: ['id'], where: 'user_id=?', whereArgs: [userId], limit: 1);
+    if (rows.isEmpty) return false;
+    return await saveDraft(rows.single['id']! as int, draft,
+            expectedMessageId: batchEndMessageId, onlyIfAbsent: true) >
+        0;
   }
 
   /// Sends the oldest ready reply without waiting for another customer's
@@ -1191,10 +1478,13 @@ class CaptureDatabase {
 
   /// Automatic sends are never retried after an uncertain click. Discarding
   /// the transient draft advances FIFO delivery without altering JSON history.
-  Future<void> discardGeneratedDraft(String userId) async {
+  Future<void> discardGeneratedDraft(String userId,
+      {String? expectedRawJson}) async {
     final db = await database;
-    await db
-        .delete('generated_drafts', where: 'user_id = ?', whereArgs: [userId]);
+    await db.delete('generated_drafts',
+        where:
+            'user_id = ?${expectedRawJson == null ? '' : ' AND raw_json = ?'}',
+        whereArgs: [userId, if (expectedRawJson != null) expectedRawJson]);
   }
 
   /// Removes the non-deliverable draft used only to trigger an automatic
@@ -1543,6 +1833,21 @@ class CaptureDatabase {
     final userId = rows.first['user_id']! as String;
     final now = DateTime.now().millisecondsSinceEpoch;
     await db.transaction((txn) async {
+      final transferDrafts = await txn.query('generated_drafts',
+          columns: ['batch_end_message_id'],
+          where: "user_id = ? AND delivery_state = 'transfer_only'",
+          whereArgs: [userId],
+          limit: 1);
+      final transferredBoundary =
+          transferDrafts.firstOrNull?['batch_end_message_id']?.toString();
+      if (transferredBoundary != null && transferredBoundary.isNotEmpty) {
+        // Consume this exact frozen batch before deleting its transfer-only
+        // draft. Previously the later cleanup found no draft and old refund
+        // requests resurfaced in unrelated future messages.
+        await txn.rawInsert('''INSERT INTO answered_cursors(user_id,message_id)
+          VALUES(?,?) ON CONFLICT(user_id) DO UPDATE SET
+          message_id=excluded.message_id''', [userId, transferredBoundary]);
+      }
       await txn.update('human_review_tickets',
           {'status': 'contacting', 'updated_at_ms': now},
           where: 'id = ?', whereArgs: [ticketId]);

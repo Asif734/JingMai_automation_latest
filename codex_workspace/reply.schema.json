@@ -20,7 +20,7 @@
     "reason"
   ],
   "properties": {
-    "reply": { "type": "string" },
+    "reply": { "type": "string", "minLength": 2 },
     "decision": {
       "type": "string",
       "enum": ["draft", "ask_clarification", "human_review_required"]

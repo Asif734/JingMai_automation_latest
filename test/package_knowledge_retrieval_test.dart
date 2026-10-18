@@ -351,7 +351,9 @@ void main() {
         'reply': 'The TD630 standard package includes 2 sheets of test paper.',
         'decision': 'draft',
         'confidence': 0.94,
-        'used_record_ids': ['family_default_package_contents_20260909'],
+        'used_record_ids': [
+          'td630_td630g_standard_package_two_free_test_sheets'
+        ],
         'required_slots': [],
         'actions': [],
         'risk_level': 'low',

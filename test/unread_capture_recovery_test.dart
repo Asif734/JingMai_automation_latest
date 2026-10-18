@@ -2,6 +2,52 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:jd_automation/capture/unread_capture_recovery.dart';
 
 void main() {
+  test('startup unread is stale until a clock or clear-to-unread transition',
+      () {
+    final tracker = SidebarUnreadTracker();
+    final start = DateTime.utc(2026, 10, 15, 5, 0);
+
+    expect(tracker.observe(customer: 'old', unread: true, observedAt: start),
+        isFalse);
+    expect(
+        tracker.observe(
+            customer: 'old',
+            unread: true,
+            observedAt: start.add(const Duration(minutes: 1))),
+        isFalse);
+    expect(
+        tracker.observe(
+            customer: 'old',
+            unread: false,
+            observedAt: start.add(const Duration(minutes: 2))),
+        isFalse);
+    expect(
+        tracker.observe(
+            customer: 'old',
+            unread: true,
+            observedAt: start.add(const Duration(minutes: 2, seconds: 2))),
+        isTrue);
+  });
+
+  test('a valid JD elapsed badge immediately verifies a new unread turn', () {
+    final tracker = SidebarUnreadTracker();
+    final now = DateTime.utc(2026, 10, 15, 5, 20, 22);
+    expect(
+        tracker.observe(
+            customer: 'new',
+            unread: true,
+            unreadAgeSeconds: 7,
+            observedAt: now),
+        isTrue);
+    expect(
+        tracker.observe(
+            customer: 'invalid',
+            unread: true,
+            unreadAgeSeconds: 9999,
+            observedAt: now),
+        isFalse);
+  });
+
   test('recent answered messages cannot pretend to recover a new unread body',
       () {
     final start = DateTime.utc(2026, 10, 7, 6, 25, 10);
@@ -245,6 +291,8 @@ void main() {
       knownIncomingIds: const {},
       knownOutgoingIds: const {},
     );
+    recovery.verifyIncomingSignal(
+        senderKey: 'current', sentAt: start, capturedAt: start);
 
     expect(recovery.useRelaxedBodyOcr(start.add(const Duration(seconds: 19))),
         isFalse);
@@ -291,6 +339,8 @@ void main() {
     )
       ..holdingSent = true
       ..holdingSentAt = start.add(const Duration(seconds: 65));
+    recovery.verifyIncomingSignal(
+        senderKey: 'current', sentAt: start, capturedAt: start);
 
     expect(recovery.resendDueAt, start.add(const Duration(seconds: 95)));
     expect(recovery.resendDue(start.add(const Duration(seconds: 65))), isFalse);
@@ -338,5 +388,49 @@ void main() {
       isTrue,
     );
     expect(recovery.hasVerifiedIncomingSignal, isTrue);
+  });
+
+  test('a recent parsed badge clock can authorize a guarded holding message',
+      () {
+    final detectedAt = DateTime.utc(2026, 10, 15, 5, 20, 22);
+    final recovery = UnreadCaptureRecovery(
+      customer: 'jd_customer',
+      unreadEvidence: 12,
+      detectedAt: detectedAt,
+      knownIncomingIds: const {},
+      knownOutgoingIds: const {},
+      sidebarUnreadVerified: true,
+    );
+
+    expect(
+        recovery.canSendHoldingAt(detectedAt.add(const Duration(seconds: 20))),
+        isTrue);
+    expect(
+        recovery.canSendHoldingAt(
+            detectedAt.add(UnreadCaptureRecovery.verifiedBadgeLifetime)),
+        isTrue);
+    expect(
+        recovery.canSendHoldingAt(detectedAt
+            .add(UnreadCaptureRecovery.verifiedBadgeLifetime)
+            .add(const Duration(milliseconds: 1))),
+        isFalse);
+  });
+
+  test('direct media probes are throttled without blocking later retries', () {
+    final start = DateTime.utc(2026, 10, 15, 5, 51, 11);
+    final recovery = UnreadCaptureRecovery(
+      customer: 'jd_customer',
+      unreadEvidence: 12,
+      detectedAt: start,
+      knownIncomingIds: const {},
+      knownOutgoingIds: const {},
+    );
+
+    expect(recovery.directMediaProbeDue(start), isTrue);
+    recovery.recordDirectMediaProbe(start);
+    expect(recovery.directMediaProbeDue(start.add(const Duration(seconds: 4))),
+        isFalse);
+    expect(recovery.directMediaProbeDue(start.add(const Duration(seconds: 5))),
+        isTrue);
   });
 }

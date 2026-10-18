@@ -30,6 +30,7 @@
 		A11C00010000000000000001 /* AccessibilityBridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = A11C00020000000000000002 /* AccessibilityBridge.swift */; };
 		A11C00030000000000000003 /* SemanticRetrievalBridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = A11C00040000000000000004 /* SemanticRetrievalBridge.swift */; };
 		A11C00050000000000000005 /* CustomerSafety.swift in Sources */ = {isa = PBXBuildFile; fileRef = A11C00060000000000000006 /* CustomerSafety.swift */; };
+		A11C00070000000000000007 /* NativeUiWorkerClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = A11C00080000000000000008 /* NativeUiWorkerClient.swift */; };
 		78A318202AECB46A00862997 /* FlutterGeneratedPluginSwiftPackage in Frameworks */ = {isa = PBXBuildFile; productRef = 78A3181F2AECB46A00862997 /* FlutterGeneratedPluginSwiftPackage */; };
 /* End PBXBuildFile section */
 
@@ -77,6 +78,7 @@
 		A11C00020000000000000002 /* AccessibilityBridge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AccessibilityBridge.swift; sourceTree = "<group>"; };
 		A11C00040000000000000004 /* SemanticRetrievalBridge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SemanticRetrievalBridge.swift; sourceTree = "<group>"; };
 		A11C00060000000000000006 /* CustomerSafety.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CustomerSafety.swift; sourceTree = "<group>"; };
+		A11C00080000000000000008 /* NativeUiWorkerClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeUiWorkerClient.swift; sourceTree = "<group>"; };
 		33CEB47222A05771004F2AC0 /* Flutter-Debug.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = "Flutter-Debug.xcconfig"; sourceTree = "<group>"; };
 		33CEB47422A05771004F2AC0 /* Flutter-Release.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = "Flutter-Release.xcconfig"; sourceTree = "<group>"; };
 		33CEB47722A0578A004F2AC0 /* Flutter-Generated.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; name = "Flutter-Generated.xcconfig"; path = "ephemeral/Flutter-Generated.xcconfig"; sourceTree = "<group>"; };
@@ -177,6 +179,7 @@
 				A11C00020000000000000002 /* AccessibilityBridge.swift */,
 				A11C00040000000000000004 /* SemanticRetrievalBridge.swift */,
 				A11C00060000000000000006 /* CustomerSafety.swift */,
+				A11C00080000000000000008 /* NativeUiWorkerClient.swift */,
 				33E51913231747F40026EE4D /* DebugProfile.entitlements */,
 				33E51914231749380026EE4D /* Release.entitlements */,
 				33CC11242044D66E0003C045 /* Resources */,
@@ -222,6 +225,7 @@
 				33CC10EB2044A3C60003C045 /* Resources */,
 				33CC110E2044A8840003C045 /* Bundle Framework */,
 				3399D490228B24CF009A79C7 /* ShellScript */,
+				A11C00090000000000000009 /* Build isolated UI worker */,
 			);
 			buildRules = (
 			);
@@ -310,6 +314,17 @@
 /* End PBXResourcesBuildPhase section */
 
 /* Begin PBXShellScriptBuildPhase section */
+		A11C00090000000000000009 /* Build isolated UI worker */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = ();
+			inputPaths = ();
+			outputPaths = ();
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "/bin/sh \"$PROJECT_DIR/../tools/build_ui_worker.sh\"\n";
+		};
 		3399D490228B24CF009A79C7 /* ShellScript */ = {
 			isa = PBXShellScriptBuildPhase;
 			alwaysOutOfDate = 1;
@@ -367,6 +382,7 @@
 				A11C00010000000000000001 /* AccessibilityBridge.swift in Sources */,
 				A11C00030000000000000003 /* SemanticRetrievalBridge.swift in Sources */,
 				A11C00050000000000000005 /* CustomerSafety.swift in Sources */,
+				A11C00070000000000000007 /* NativeUiWorkerClient.swift in Sources */,
 				33CC10F12044A3C60003C045 /* AppDelegate.swift in Sources */,
 				335BBD1B22A9A15E00E9071D /* GeneratedPluginRegistrant.swift in Sources */,
 			);

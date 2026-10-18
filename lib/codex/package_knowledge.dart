@@ -79,6 +79,19 @@ Set<String> knowledgeProductModels(Object? rawModels) => {
 
 /// Family membership comes from dataset metadata, never from model prefixes.
 Set<String> knowledgeProductFamilies(Map<String, Object?> record) {
+  // Exported section metadata can inherit the parent document's family even
+  // in a mixed-product manual. An explicit leaf heading is more specific:
+  // "5. 针式机纸张与速度边界" must not become thermal-printer evidence.
+  if (record['status'] != 'active' && record['title'] != null) {
+    final heading = record['title'].toString().split('>').last.toLowerCase();
+    final headingFamilies = <String>{
+      if (RegExp(r'dot.?matrix|needle.?printer|针式').hasMatch(heading))
+        'dot_matrix',
+      if (RegExp(r'thermal|热敏').hasMatch(heading)) 'thermal',
+      if (RegExp(r'attendance|考勤|打卡机').hasMatch(heading)) 'attendance',
+    };
+    if (headingFamilies.length == 1) return headingFamilies;
+  }
   final identity = [
     record['product_line'],
     record['models'],

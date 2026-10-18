@@ -2,6 +2,7 @@ import 'dart:io';
 
 import 'package:path/path.dart' as p;
 import '../runtime/app_runtime.dart';
+import 'media_process_runner.dart';
 
 class ExtractedVideoAudio {
   const ExtractedVideoAudio({
@@ -18,11 +19,15 @@ class ExtractedVideoAudio {
 }
 
 class VideoAudioExtractor {
-  const VideoAudioExtractor({this.ffmpegExecutable, this.ffprobeExecutable});
+  const VideoAudioExtractor(
+      {this.ffmpegExecutable,
+      this.ffprobeExecutable,
+      this.processTimeout = const Duration(seconds: 5)});
 
   static const audibleThresholdDb = -55.0;
   final String? ffmpegExecutable;
   final String? ffprobeExecutable;
+  final Duration processTimeout;
 
   List<String> probeArguments(String inputPath) => [
         '-v',
@@ -72,7 +77,8 @@ class VideoAudioExtractor {
       throw VideoAudioExtractionException('Video is missing: $videoPath');
     }
     final ffprobe = ffprobeExecutable ?? await _findExecutable('ffprobe');
-    final probe = await Process.run(ffprobe, probeArguments(videoPath));
+    final probe = await const MediaProcessRunner()
+        .run(ffprobe, probeArguments(videoPath), timeout: processTimeout);
     if (probe.exitCode != 0) {
       throw VideoAudioExtractionException(
           'FFprobe could not inspect the video audio: ${probe.stderr}');
@@ -87,13 +93,15 @@ class VideoAudioExtractor {
     final ffmpeg = ffmpegExecutable ?? await _findExecutable('ffmpeg');
     final audioPath = p.join(video.parent.path,
         '${p.basenameWithoutExtension(videoPath)}_audio.wav');
-    final extraction =
-        await Process.run(ffmpeg, extractionArguments(videoPath, audioPath));
+    final extraction = await const MediaProcessRunner().run(
+        ffmpeg, extractionArguments(videoPath, audioPath),
+        timeout: processTimeout);
     if (extraction.exitCode != 0 || !await File(audioPath).exists()) {
       throw VideoAudioExtractionException(
           'FFmpeg could not extract the video audio: ${extraction.stderr}');
     }
-    final volume = await Process.run(ffmpeg, volumeArguments(audioPath));
+    final volume = await const MediaProcessRunner()
+        .run(ffmpeg, volumeArguments(audioPath), timeout: processTimeout);
     final diagnostic = '${volume.stdout}\n${volume.stderr}';
     final match = RegExp(r'mean_volume:\s*(-?(?:\d+(?:\.\d+)?|inf))\s*dB')
         .firstMatch(diagnostic);

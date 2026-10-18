@@ -6,7 +6,7 @@ import 'package:jd_automation/domain/capture_models.dart';
 import 'package:jd_automation/storage/capture_database.dart';
 
 const _answer =
-    '''{"reply":"Restart the printer and reconnect the USB cable.","decision":"draft","confidence":0.9,"used_record_ids":[],"required_slots":[],"actions":[],"risk_level":"low","risk_triggers":[],"auto_send_allowed":false,"attachments":[],"image_descriptions":[],"human_review_required":false,"reason":null}''';
+    '''{"reply":"Restart the printer and reconnect the USB cable.","decision":"draft","confidence":0.9,"used_record_ids":["safe_restart"],"required_slots":[],"actions":[],"risk_level":"low","risk_triggers":[],"auto_send_allowed":false,"attachments":[],"image_descriptions":[],"human_review_required":false,"reason":null}''';
 const _unresolved =
     '''{"reply":"I cannot resolve this technical printer issue.","decision":"human_review_required","confidence":0.4,"used_record_ids":[],"required_slots":[],"actions":[],"risk_level":"high","risk_triggers":["unresolved printer issue"],"auto_send_allowed":false,"attachments":[],"image_descriptions":[],"human_review_required":true,"reason":"No solution found"}''';
 
@@ -20,7 +20,10 @@ void main() {
     root = await Directory.systemTemp.createTemp('jd_watchdog_');
     database = CaptureDatabase(storageRoot: Directory('${root.path}/data'));
     await Directory('${root.path}/workspace').create();
-    await Directory('${root.path}/knowledge').create();
+    final ragCards = await Directory('${root.path}/knowledge/rag_cards')
+        .create(recursive: true);
+    await File('${ragCards.path}/customer_service_rag_cards.jsonl').writeAsString(
+        '{"id":"safe_restart","status":"active","keywords":["printer","not working","USB"],"issue":"printer USB recovery","reply_template":"Restart the printer and reconnect the USB cable."}\n');
     cli = File('${root.path}/codex.sh');
     await database.saveCapture(CapturedConversation(
       stableKey: 'customer:watchdog',

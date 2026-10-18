@@ -49,6 +49,79 @@ To inspect an installation without starting capture or opening customer data,
 run its executable with `JD_INSTALLATION_CHECK=1`; it reports the resolved
 resource/data paths and checks that the bundled media tools launch.
 
+## Local Qwen second inspection
+
+The current Review/Codex flow keeps the existing first-pass keyword/Apple
+retrieval. Only a second knowledge inspection uses
+`Qwen3-Embedding-0.6B-Q8_0`: independent semantic retrieval across all eligible
+customer-KB records, combined with lexical results by rank fusion. English and
+Chinese questions are preserved. Model/category checks still apply; developer
+notes and customer histories are not indexed.
+
+One-time setup on the Review Mac:
+
+```sh
+brew install llama.cpp
+zsh tools/download_qwen_embeddings.sh
+```
+
+This downloads the official, revision-pinned 639 MB GGUF directly from Hugging
+Face and verifies its SHA-256. The app starts its own loopback-only native
+embedding process; no separate model service or Python runtime is required.
+`JD_LLAMA_SERVER` and `JD_QWEN_MODEL_PATH` can specify explicit native-runtime
+and model paths. The default weights and derived index live in
+`data/qwen_embeddings/`, outside the app bundle. For Standalone, pass its
+Application Support `data/qwen_embeddings` path to the download script.
+
+Preparation runs in the background and persists knowledge-only vectors.
+The initial full index takes longer than subsequent queries; prepare it before
+enabling production automation with this retrieval-only check:
+
+```sh
+flutter test --no-pub --dart-define=JD_QWEN_LIVE_TEST=true test/qwen_semantic_live_test.dart --reporter expanded
+```
+
+It does not open JD or send messages. A missing model, incomplete index,
+invalid embedding, or native timeout is a retriable retrieval failure, not
+permission to claim that two searches found no answer or to transfer a chat.
+The standalone packager includes the small native runtime/libraries but excludes
+downloaded weights and embedding caches from its initial-data snapshot.
+
+### Evidence selection and answer policy
+
+Queries now keep the current request and only necessary follow-up context.
+Second-pass fusion preserves a candidate's best rank with bounded agreement,
+rather than letting repeated query variants bury a strong single-engine hit.
+Before applying the evidence limit, selection deduplicates source paragraphs,
+expands operation-relevant sections of retrieved KB sources, and checks coverage
+of the requested operations. Explicit mixed-document section headings override
+incorrect inherited product-family labels; no sales-model/structure mapping is
+invented. Applicable universal safety procedures are reserved independently of
+search rank.
+
+A risk label alone is neither missing knowledge nor a transfer instruction.
+Hypothetical safety questions receive the supplied conditional safety guidance;
+reported active incidents retain that guidance in the actual handoff notice.
+Supported troubleshooting may state a conditional repair boundary without
+immediately transferring the customer. Missing answers still require a fresh
+second inspection, but automatic knowledge-exhaustion handoff is restricted to
+unresolved technical problems. Sales, recommendations, specifications and other
+nontechnical questions stay in the chat with a supported answer, precise
+limitation or useful clarification. Explicit-transfer, refund and active-safety
+policies remain separate. Exact-model lifecycle list rows are supplied alongside
+specification tables; Current/Legacy/Discontinued never proves live stock.
+Stable reply rules live once in `codex_workspace/AGENTS.md`; requests add only
+short turn-specific instructions. General no-answer cases ask one useful new
+clarification rather than transferring or repeating a holding promise.
+
+Generation-only quality checks use synthetic customers and temporary histories;
+they never open JD, send replies, or transfer conversations. They use the
+configured Codex account and are opt-in:
+
+```sh
+flutter test --no-pub --dart-define=JD_ANSWER_QUALITY_LIVE=true test/answer_quality_live_test.dart --reporter expanded
+```
+
 ## RAG backend
 
 The backend loads curated customer-service cards and supporting source chunks. It provides lexical retrieval immediately, optional FAISS vector retrieval using OpenAI embeddings, and structured Simplified-Chinese reply drafts. Desktop delivery remains guarded by exact JD customer verification.
@@ -75,6 +148,33 @@ The macOS JD capture path recognizes outlined play controls throughout an incomi
 Capture, sender labels, chat switching, and send acknowledgements require the same complete customer ID. OCR lookalikes (`1`/`l`), different case, truncated prefixes, missing identities, and conflicting headers do not create aliases. History files are checked against their stored `user_id`; newly verified media must remain inside its owner's media directory. Model session files also carry their exact owner, and older unbound sessions start fresh.
 
 Both variants share an OS automation lock under `~/Library/Application Support/JD Automation Shared/automation.lock`. Close the other variant before starting automation. The lock is held for the controller's lifetime, including while paused, and the OS releases it after process exit or a crash. Expired queued chat-switch/send operations are rejected before UI input.
+
+Incoming images use verified cache originals first. If original matching fails,
+an actual sender-bounded attachment rectangle may be retained as a partial
+preview after customer, message-clock and unchanged-screenshot checks. White,
+grey and black previews are not rejected for lacking contrast. Empty inferred
+viewports and ordinary typed bubbles are not image fallbacks; no Save As/menu
+actions are used. Partial previews are explicitly labelled for Codex and never
+prove a video's unseen contents. Customer + JD timestamp + attachment slot
+identifies a preview event, with the file SHA-256 saved separately. Repeated
+scans do not create messages; a later original upgrades that exact event while
+preserving reply cursors. An identical image at a new timestamp is new work.
+
+An already acquired/queued original video suppresses another preview of that
+same customer/timestamp/slot, including flat posters. Media input revisions are
+bounded by each reply's frozen incoming clock: later uploads remain queued for
+their own replies, rather than discarding an earlier completed answer. The
+video-analysis stage persists its report against the exact customer, event,
+timestamp, hash and frame fingerprint, with a separate two-minute deadline per
+video. After analysis completes or explicitly fails, retrieval and both reply
+inspections receive a fresh 100-second budget. Replies use the saved reports,
+not another pass through the video frames; ordinary photos remain visual
+inputs. Failed analysis is explicitly unavailable, never invented contents or
+proof of a missing upload. Retries reuse completed reports and exact failed
+attempts; legacy short-prepass failures get one attempt under the new policy.
+A new event receives a fresh analysis. A holding
+receipt covers only incoming messages sent before it. A genuinely later event
+gets its own deadline, with a 50-second holding-message cooldown.
 
 Delivery recovery is independent of capture: while automation is running, a five-second tick revisits durable drafts, generation work, and holding-message jobs. Chat-opening callbacks have a ten-second watchdog and send callbacks an eighteen-second watchdog; these do not cancel OS work. A missing send callback is treated as `send_unconfirmed`, retained for exact outgoing-receipt reconciliation and safe retry, not recorded as sent. Failed attempts retry without a fixed attempt limit. The serial worker releases after queue/refresh errors, skips human-contacting chats, and allows capture scans to join the UI queue between deliveries. Queue updates and acknowledgements are bound to the exact customer, draft creation, pending ID, reply, and incoming-batch boundary, so a late attempt cannot consume a replacement batch.
 

@@ -9,6 +9,145 @@ import 'package:jd_automation/storage/capture_database.dart';
 
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
+  test('a failed newest video is not answered using older video contents',
+      () async {
+    final root =
+        await Directory.systemTemp.createTemp('jd_unreadable_new_video_');
+    final database =
+        CaptureDatabase(storageRoot: Directory('${root.path}/data'));
+    addTearDown(() async {
+      await database.close();
+      await root.delete(recursive: true);
+    });
+    final at = DateTime.utc(2026, 10, 16, 3, 48, 4);
+    await database.saveCapture(CapturedConversation(
+      stableKey: 'customer:buyer',
+      customerName: 'buyer',
+      customerExternalId: 'buyer',
+      capturedAt: at.add(const Duration(seconds: 40)),
+      messages: [
+        CapturedMessage(
+            stableId: 'question-new-video',
+            direction: 'incoming',
+            body: 'what is in the video?',
+            sentAt: at.add(const Duration(seconds: 40)),
+            axPath: 'test')
+      ],
+    ));
+    await (await database.history).recordMediaCaptureFailure('buyer', 'video',
+        sentAt: at, reason: 'video_message_reference_unavailable');
+    final service = CodexReplyService(
+        executable: '/must-not-invoke-old-video-context',
+        workspace: Directory('${root.path}/workspace'),
+        knowledgeDirectory: Directory('${root.path}/knowledge'),
+        outputSchema: File('${root.path}/reply.schema.json'));
+    final draft = await service.generate(
+        conversation: (await database.conversations()).single,
+        database: database);
+    expect(draft.model, 'jd-media-read-recovery-v1');
+    expect(draft.reply, contains('haven’t been able to read its contents'));
+    expect(draft.reply, isNot(contains('self-test')));
+    expect(draftRequiresHumanReview(draft), isFalse);
+  });
+
+  test('a new media event routes reused photos and video to separate stages',
+      () async {
+    final root = await Directory.systemTemp.createTemp('jd_resent_media_');
+    final database =
+        CaptureDatabase(storageRoot: Directory('${root.path}/data'));
+    addTearDown(() async {
+      await database.close();
+      await root.delete(recursive: true);
+    });
+    final workspace = await Directory('${root.path}/workspace').create();
+    final knowledge = await Directory('${root.path}/knowledge').create();
+    final store = await database.history;
+    final photo = File(await store.saveMedia(
+        userId: 'buyer', filename: 'reused-photo.png', bytes: [1, 2, 3]));
+    final frame = File(await store.saveMedia(
+        userId: 'buyer', filename: 'reused-video-frame.jpg', bytes: [4, 5, 6]));
+    final argsLog = File('${root.path}/args.log');
+    final promptLog = File('${root.path}/prompt.log');
+    final fake = File('${root.path}/fake-codex.sh');
+    await fake.writeAsString('''#!/bin/sh
+printf '%s\\n' "\$*" >> "${argsLog.path}"
+output=''
+while [ "\$#" -gt 0 ]; do
+  if [ "\$1" = '--output-last-message' ]; then
+    shift
+    output="\$1"
+  fi
+  shift
+done
+cat > "${promptLog.path}"
+printf '%s\\n' '{"reply":"What happens when you press the button?","decision":"ask_clarification","confidence":0.9,"used_record_ids":[],"required_slots":["observed behavior"],"actions":[],"risk_level":"low","risk_triggers":[],"auto_send_allowed":false,"model":"test","attachments":[],"image_descriptions":[],"human_review_required":false,"reason":null}' > "\$output"
+printf '%s\\n' '{"type":"thread.started","thread_id":"resent-media-thread"}'
+''');
+    expect((await Process.run('chmod', ['+x', fake.path])).exitCode, 0);
+    await database.saveCapture(CapturedConversation(
+      stableKey: 'customer:buyer',
+      customerName: 'buyer',
+      customerExternalId: 'buyer',
+      capturedAt: DateTime.utc(2026, 10, 16, 3, 26, 16),
+      messages: [
+        CapturedMessage(
+          stableId: 'visible-video:reused:1792121167',
+          direction: 'incoming',
+          body: '[Customer sent a video]',
+          sentAt: DateTime.utc(2026, 10, 16, 3, 26, 7),
+          axPath: 'test',
+          media: [
+            CapturedMedia(
+                type: 'image',
+                path: photo.path,
+                description: 'Previous photo analysis.'),
+            CapturedMedia(
+                type: 'image',
+                path: frame.path,
+                description: 'Previous video analysis.',
+                captureSource: 'jd_video_frame_1fps'),
+          ],
+        )
+      ],
+    ));
+    final service = CodexReplyService(
+        executable: fake.path,
+        workspace: workspace,
+        knowledgeDirectory: knowledge,
+        outputSchema: File('${root.path}/reply.schema.json'));
+    await service.generate(
+        conversation: (await database.conversations()).single,
+        database: database);
+    final arguments = await argsLog.readAsLines();
+    expect(arguments.first, contains(frame.path));
+    expect(arguments.first, contains('video-report.schema.json'));
+    expect(arguments.last, contains(photo.path));
+    expect(arguments.last, isNot(contains(frame.path)));
+    final prompt = await promptLog.readAsString();
+    final request = jsonDecode(
+            prompt.split('<request_json>\n')[1].split('\n</request_json>')[0])
+        as Map<String, dynamic>;
+    expect(request['image_analysis_required'], isTrue);
+    expect(prompt, contains('Follow AGENTS.md.'));
+    final requirements = (request['requirements'] as List).join('\n');
+    expect(requirements.length, lessThan(4000));
+    expect(requirements, contains('General/sales: if no answer is found'));
+    expect(requirements, contains('keep events separate'));
+    // Stable safety rules live once in AGENTS.md, not in every request too.
+    final policy = await File('codex_workspace/AGENTS.md').readAsString();
+    expect(policy, contains('D E'));
+    expect(policy, contains('complete absolute URL'));
+    expect(policy, contains('byte-for-byte'));
+    expect(policy, contains('raw URL on its own line'));
+    expect(policy, contains('otherwise omit it'));
+    expect(policy, contains('Use only this customer'));
+    expect(policy.split(RegExp(r'\s+')).length, lessThan(650));
+    expect(request['attached_video_frame_paths'], isEmpty);
+    expect(request['attached_image_paths'], [photo.path]);
+    expect(request['video_report_preflight']['unreported_message_ids'],
+        ['visible-video:reused:1792121167']);
+  });
+
   test('capacity failure retries primary model then uses fallback', () async {
     final root = await Directory.systemTemp.createTemp('jd_capacity_fallback_');
     final database =
@@ -20,6 +159,9 @@ void main() {
     final workspace = await Directory('${root.path}/workspace').create();
     final knowledge = await Directory('${root.path}/knowledge').create();
     final modelLog = File('${root.path}/models.log');
+    final cards = await Directory('${knowledge.path}/rag_cards').create();
+    await File('${cards.path}/customer_service_rag_cards.jsonl').writeAsString(
+        '{"id":"usb_connection","status":"active","keywords":["USB","connecting"],"reply_template":"Check USB connection."}\n');
     final fakeCodex = File('${root.path}/fake-codex.sh');
     await fakeCodex.writeAsString('''#!/bin/sh
 output=''
@@ -40,7 +182,7 @@ if [ "\$model" = 'gpt-6.1-sol' ]; then
   printf '%s\n' '{"type":"error","message":"Selected model is at capacity. Please try a different model."}'
   exit 1
 fi
-printf '%s\n' '{"reply":"Recovered with fallback.","decision":"draft","confidence":0.9,"used_record_ids":[],"required_slots":[],"actions":[],"risk_level":"low","risk_triggers":[],"auto_send_allowed":false,"model":"untrusted","attachments":[],"image_descriptions":[],"human_review_required":false,"reason":null}' > "\$output"
+printf '%s\n' '{"reply":"Recovered with fallback.","decision":"draft","confidence":0.9,"used_record_ids":["usb_connection"],"required_slots":[],"actions":[],"risk_level":"low","risk_triggers":[],"auto_send_allowed":false,"model":"untrusted","attachments":[],"image_descriptions":[],"human_review_required":false,"reason":null}' > "\$output"
 printf '%s\n' '{"type":"thread.started","thread_id":"fallback-thread"}'
 ''');
     expect((await Process.run('chmod', ['+x', fakeCodex.path])).exitCode, 0);
@@ -89,8 +231,8 @@ printf '%s\n' '{"type":"thread.started","thread_id":"fallback-thread"}'
     });
     final workspace = await Directory('${root.path}/workspace').create();
     final knowledge = await Directory('${root.path}/knowledge').create();
-    final photo = File('${root.path}/customer.png');
-    await photo.writeAsBytes([1, 2, 3]);
+    final photo = File(await (await database.history).saveMedia(
+        userId: 'buyer', filename: 'customer.png', bytes: [1, 2, 3]));
     await database.saveCapture(CapturedConversation(
       stableKey: 'customer:buyer',
       customerName: 'buyer',
@@ -351,6 +493,10 @@ fi
     });
     final workspace = await Directory('${root.path}/workspace').create();
     final knowledge = await Directory('${root.path}/knowledge').create();
+    final ragCards =
+        await Directory('${knowledge.path}/rag_cards').create(recursive: true);
+    await File('${ragCards.path}/customer_service_rag_cards.jsonl').writeAsString(
+        '{"id":"safe_restart","status":"active","keywords":["printer","not working","USB"],"issue":"printer USB recovery","reply_template":"Restart the printer and reconnect the USB cable."}\n');
     final counter = File('${root.path}/attempt-count');
     final fakeCodex = File('${root.path}/fake-codex.sh');
     await fakeCodex.writeAsString('''#!/bin/sh
@@ -370,7 +516,7 @@ printf '%s' "\$count" > "${counter.path}"
 if [ "\$count" -eq 1 ]; then
   printf '%s\\n' '{"reply":"I cannot resolve this technical printer issue.","decision":"human_review_required","confidence":0.4,"used_record_ids":[],"required_slots":[],"actions":[],"risk_level":"high","risk_triggers":["unresolved printer issue"],"auto_send_allowed":false,"model":"test","attachments":[],"image_descriptions":[],"human_review_required":true,"reason":"No solution found"}' > "\$output"
 else
-  printf '%s\\n' '{"reply":"Restart the printer, then reconnect the USB cable and print one test page.","decision":"draft","confidence":0.8,"used_record_ids":[],"required_slots":[],"actions":[],"risk_level":"low","risk_triggers":[],"auto_send_allowed":false,"model":"test","attachments":[],"image_descriptions":[],"human_review_required":false,"reason":null}' > "\$output"
+  printf '%s\\n' '{"reply":"Restart the printer, then reconnect the USB cable and print one test page.","decision":"draft","confidence":0.8,"used_record_ids":["safe_restart"],"required_slots":[],"actions":[],"risk_level":"low","risk_triggers":[],"auto_send_allowed":false,"model":"test","attachments":[],"image_descriptions":[],"human_review_required":false,"reason":null}' > "\$output"
 fi
 ''');
     expect((await Process.run('chmod', ['+x', fakeCodex.path])).exitCode, 0);
@@ -434,7 +580,7 @@ printf '%s' "\$count" > "${counter.path}"
 if [ "\$count" -eq 1 ]; then
   printf '%s\n' '{"reply":"The TP730 driver is not confirmed in the current product information.","decision":"human_review_required","confidence":0.5,"used_record_ids":[],"required_slots":[],"actions":[],"risk_level":"high","risk_triggers":["unconfirmed driver"],"auto_send_allowed":false,"model":"test","attachments":[],"image_descriptions":[],"human_review_required":true,"reason":"Not found on first pass"}' > "\$output"
 else
-  printf '%s\n' '{"reply":"The TP730 Windows driver is documented in the matching product manual.","decision":"draft","confidence":0.9,"used_record_ids":["manual"],"required_slots":[],"actions":[],"risk_level":"low","risk_triggers":[],"auto_send_allowed":false,"model":"test","attachments":[],"image_descriptions":[],"human_review_required":false,"reason":null}' > "\$output"
+  printf '%s\n' '{"reply":"The TP730 Windows driver is documented in the matching product manual.","decision":"draft","confidence":0.9,"used_record_ids":["thermal_driver_install_recognition_20260921"],"required_slots":[],"actions":[],"risk_level":"low","risk_triggers":[],"auto_send_allowed":false,"model":"test","attachments":[],"image_descriptions":[],"human_review_required":false,"reason":null}' > "\$output"
 fi
 ''');
     expect((await Process.run('chmod', ['+x', fakeCodex.path])).exitCode, 0);
@@ -481,8 +627,8 @@ fi
     });
     final workspace = await Directory('${root.path}/workspace').create();
     final knowledge = await Directory('${root.path}/knowledge').create();
-    final photo = File('${root.path}/customer.png');
-    await photo.writeAsBytes([1, 2, 3]);
+    final photo = File(await (await database.history).saveMedia(
+        userId: 'buyer', filename: 'customer.png', bytes: [1, 2, 3]));
     await database.saveCapture(CapturedConversation(
       stableKey: 'customer:buyer',
       customerName: 'buyer',

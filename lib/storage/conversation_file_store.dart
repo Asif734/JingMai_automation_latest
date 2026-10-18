@@ -7,6 +7,10 @@ import 'package:path/path.dart' as p;
 
 import '../domain/capture_models.dart';
 import '../domain/customer_identity.dart';
+import '../domain/media_identity.dart';
+import '../capture/ocr_text_sanitizer.dart';
+import '../capture/reply_message_scope.dart';
+import '../codex/customer_video_report.dart';
 
 class ConversationFileStore {
   ConversationFileStore(this.rootDirectory);
@@ -20,6 +24,34 @@ class ConversationFileStore {
 
   Future<CaptureAppendResult> appendCapture(CapturedConversation capture) {
     final userId = capture.customerExternalId ?? capture.customerName;
+    // An absent outer verification flag must not permit references to another
+    // customer's already-owned media directory or conflicting native proof.
+    final ownMediaRoot =
+        p.absolute(p.join(mediaDirectory.path, safeUserId(userId)));
+    for (final message
+        in capture.messages.where((m) => m.direction == 'incoming')) {
+      for (final media in message.media) {
+        final path = p.normalize(p.absolute(media.path));
+        if ((media.verifiedCustomerId != null &&
+                media.verifiedCustomerId != userId) ||
+            (p.isWithin(p.absolute(mediaDirectory.path), path) &&
+                !p.isWithin(ownMediaRoot, path))) {
+          throw StateError('Incoming media belongs to a different customer.');
+        }
+        if (p.isWithin(ownMediaRoot, path)) {
+          final file = File(path);
+          final owner = Directory(ownMediaRoot);
+          _verifyMediaDirectoryOwner(userId, owner);
+          if (file.existsSync() &&
+              owner.existsSync() &&
+              !p.isWithin(owner.resolveSymbolicLinksSync(),
+                  file.resolveSymbolicLinksSync())) {
+            throw StateError(
+                'Incoming media resolves to a different customer.');
+          }
+        }
+      }
+    }
     if (capture.verifiedCustomerId case final verified?) {
       if (verified != userId || capture.customerName != userId) {
         throw StateError(
@@ -61,17 +93,18 @@ class ConversationFileStore {
       );
       final messages =
           (document['messages'] as List<Object?>).cast<Map<String, Object?>>();
-      final knownIds =
-          messages.map((item) => item['id']).whereType<String>().toSet();
-      final knownIncomingVariants = <String, Set<String>>{};
-      for (final item in messages.where((item) =>
-          item['direction'] == 'incoming' &&
-          (item['source'] == 'jd_automation' ||
-              item['source'] == 'qianniu_capture'))) {
-        final raw = item['body']?.toString() ?? '';
-        final canonical = _ocrCanonical(raw);
-        if (canonical.isNotEmpty) {
-          knownIncomingVariants.putIfAbsent(canonical, () => {}).add(raw);
+      final knownIds = messages
+          .expand((item) => [item['id'], item['original_media_id']])
+          .whereType<String>()
+          .toSet();
+      final knownMediaEvents = <String, List<DateTime?>>{};
+      for (final item
+          in messages.where((item) => item['direction'] == 'incoming')) {
+        final content = _mediaContentKey(item['id']?.toString() ?? '');
+        if (content != null) {
+          knownMediaEvents
+              .putIfAbsent(content, () => [])
+              .add(DateTime.tryParse(item['sent_at']?.toString() ?? ''));
         }
       }
       var inserted = 0;
@@ -79,9 +112,67 @@ class ConversationFileStore {
       final insertedOutgoingIds = <String>[];
       String? lastInsertedDirection;
       for (var index = 0; index < capture.messages.length; index++) {
-        final message = capture.messages[index];
+        var message = capture.messages[index];
+        if (message.direction == 'incoming' && message.media.isEmpty) {
+          final body = sanitizeJdOcrText(message.body);
+          if (body.isEmpty) continue;
+          if (body != message.body) {
+            message = CapturedMessage(
+                stableId: message.stableId,
+                direction: message.direction,
+                body: body,
+                sender: message.sender,
+                sentAt: message.sentAt,
+                axPath: message.axPath,
+                deliveryConfirmed: message.deliveryConfirmed);
+          }
+        }
         if (!knownIds.add(message.stableId)) continue;
-        if (message.direction == 'incoming') {
+        // A verified original upgrades this exact customer's preview event.
+        // Preserve the durable ID used by reply cursors; remember the original
+        // ID as an alias so subsequent cache scans cannot insert it again.
+        final eventKeys = message.media
+            .map((m) => m.sourceEventKey)
+            .whereType<String>()
+            .toSet();
+        if (message.direction == 'incoming' &&
+            eventKeys.length == 1 &&
+            message.media.any((m) => !m.isPartial)) {
+          final preview = messages
+              .where((item) =>
+                  item['direction'] == 'incoming' &&
+                  sameMediaMessageTime(
+                      DateTime.tryParse(item['sent_at']?.toString() ?? ''),
+                      message.sentAt) &&
+                  (item['media'] as List<Object?>? ?? const [])
+                      .whereType<Map>()
+                      .any((m) =>
+                          m['source_event_key'] == eventKeys.single &&
+                          m['capture_source'] == 'verified_attachment_preview'))
+              .firstOrNull;
+          if (preview != null) {
+            preview
+              ..['body'] = message.body
+              ..['media'] = [for (final media in message.media) media.toJson()]
+              ..['original_media_id'] = message.stableId
+              ..['captured_at'] = capture.capturedAt.toUtc().toIso8601String();
+            inserted++;
+            lastInsertedDirection = 'incoming';
+            insertedIncomingIds.add(preview['id']! as String);
+            continue;
+          }
+        }
+        final mediaContent = _mediaContentKey(message.stableId);
+        if (message.direction == 'incoming' && mediaContent != null) {
+          final times = knownMediaEvents.putIfAbsent(mediaContent, () => []);
+          if (times.any((time) => sameMediaMessageTime(time, message.sentAt))) {
+            continue;
+          }
+          times.add(message.sentAt);
+        }
+        // Different media can have identical placeholder text and timestamps.
+        // Only the content AND JD send timestamp identify the same media event.
+        if (message.direction == 'incoming' && message.media.isEmpty) {
           final canonical = _ocrCanonical(message.body);
           final sameBubbleIndex = messages.lastIndexWhere((item) =>
               item['direction'] == 'incoming' &&
@@ -139,10 +230,11 @@ class ConversationFileStore {
                     capture.capturedAt.toUtc().toIso8601String();
               inserted++;
               lastInsertedDirection = 'incoming';
-              final alreadyAnswered = messages.skip(upgradeIndex + 1).any(
-                  (item) =>
-                      item['direction'] == 'outgoing' &&
-                      item['source'] != 'sla_fallback');
+              final alreadyAnswered = messages.any((item) =>
+                  replyAnswersIncoming(
+                      reply: item,
+                      incomingId: existing['id']?.toString() ?? '',
+                      messages: messages));
               if (!alreadyAnswered) {
                 insertedIncomingIds
                     .add(existing['id']?.toString() ?? message.stableId);
@@ -150,11 +242,10 @@ class ConversationFileStore {
             }
             continue;
           }
-          final variants = knownIncomingVariants[canonical];
-          // A different OCR spelling of the same canonical text is an old
-          // visible bubble being re-read. An exact repeated customer message
-          // is still allowed when its timestamp-derived stable ID is new.
-          if (variants != null && !variants.contains(message.body)) continue;
+          // Text similarity alone never identifies a JD message. The same
+          // question (including changed spacing/punctuation) at a new sender
+          // timestamp is new work. Timestamp-scoped checks above/below still
+          // suppress OCR variants of the *same* visible bubble.
           final recentDuplicate = messages.reversed.take(12).any((item) {
             if (item['direction'] != 'incoming' ||
                 (item['source'] != 'jd_automation' &&
@@ -176,9 +267,6 @@ class ConversationFileStore {
                 item['body']?.toString() ?? '', message.body);
           });
           if (recentDuplicate) continue;
-          knownIncomingVariants
-              .putIfAbsent(canonical, () => {})
-              .add(message.body);
         }
         if (message.direction == 'outgoing') {
           final matchingAutomatedReply = messages.reversed
@@ -190,10 +278,16 @@ class ConversationFileStore {
                       _sameBubbleTime(item['sent_at'], message.sentAt)))
               .firstOrNull;
           if (matchingAutomatedReply != null) {
-            if (matchingAutomatedReply['delivery_status'] != 'sent') {
+            // A matching clock alone can be OCR inside a thumbnail. Only the
+            // exact reply text with its dated, visible receipt confirms a send.
+            if (matchingAutomatedReply['delivery_status'] != 'sent' &&
+                message.deliveryConfirmed &&
+                message.sentAt != null &&
+                _sameReply(matchingAutomatedReply['body']?.toString() ?? '',
+                    message.body)) {
               matchingAutomatedReply['delivery_status'] = 'sent';
               matchingAutomatedReply['sent_at'] =
-                  capture.capturedAt.toUtc().toIso8601String();
+                  message.sentAt!.toUtc().toIso8601String();
               inserted++;
             }
             continue;
@@ -210,6 +304,20 @@ class ConversationFileStore {
           if (message.deliveryConfirmed) 'delivery_status': 'sent',
           'media': [for (final media in message.media) media.toJson()],
         });
+        final unavailable = document['unavailable_customer_media'];
+        if (message.direction == 'incoming' &&
+            message.media.isNotEmpty &&
+            unavailable is Map &&
+            message.sentAt != null) {
+          final missingAt =
+              DateTime.tryParse(unavailable['sent_at']?.toString() ?? '');
+          if (missingAt != null &&
+              sameMediaMessageTime(message.sentAt, missingAt) &&
+              message.media.any((media) =>
+                  media.type == unavailable['kind'] && !media.isPartial)) {
+            document.remove('unavailable_customer_media');
+          }
+        }
         inserted++;
         lastInsertedDirection = message.direction;
         if (message.direction == 'incoming') {
@@ -231,7 +339,8 @@ class ConversationFileStore {
   /// Adds factual visual descriptions to already captured media without
   /// writing an unsent customer reply into conversation history.
   Future<int> updateMediaDescriptions(
-          String userId, Map<String, String> descriptions) =>
+          String userId, Map<String, String> descriptions,
+          {Set<String>? messageIds}) =>
       _serialized(userId, () async {
         if (descriptions.isEmpty) return 0;
         final document = await read(userId);
@@ -239,6 +348,9 @@ class ConversationFileStore {
         var changed = 0;
         final messages = document['messages'] as List<Object?>? ?? const [];
         for (final message in messages.whereType<Map<String, dynamic>>()) {
+          if (messageIds != null && !messageIds.contains(message['id'])) {
+            continue;
+          }
           final mediaItems = message['media'] as List<Object?>? ?? const [];
           for (final media in mediaItems.whereType<Map<String, dynamic>>()) {
             final path = media['path']?.toString();
@@ -252,6 +364,68 @@ class ConversationFileStore {
         }
         if (changed > 0) await _write(document, userId);
         return changed;
+      });
+
+  Future<bool> saveCustomerVideoReport(
+          String userId, CustomerVideoReport report) =>
+      _serialized(userId, () async {
+        if (report.event.customer != userId) {
+          throw StateError('Video report owner mismatch.');
+        }
+        final document = await read(userId);
+        if (document == null) return false;
+        final message = (document['messages'] as List)
+            .whereType<Map<String, dynamic>>()
+            .where((m) =>
+                m['id'] == report.event.messageId &&
+                m['direction'] == 'incoming')
+            .firstOrNull;
+        if (message == null ||
+            CustomerVideoEvent(userId, message).fingerprint !=
+                report.event.fingerprint) {
+          return false;
+        }
+        message['video_report'] = report.toJson();
+        for (final media in (message['media'] as List).whereType<Map>()) {
+          if (report.descriptions[media['path']] case final description?) {
+            media['description'] = description;
+          }
+        }
+        await _write(document, userId);
+        return true;
+      });
+
+  Future<void> recordVideoReportFailure(
+          String userId, List<CustomerVideoEvent> events, String reason) =>
+      _serialized(userId, () async {
+        if (events.any((e) => e.customer != userId)) {
+          throw StateError('Video attempt owner mismatch.');
+        }
+        final document = await read(userId);
+        if (document == null) return;
+        var changed = false;
+        for (final message in (document['messages'] as List)
+            .whereType<Map<String, dynamic>>()) {
+          final event =
+              events.where((e) => e.messageId == message['id']).firstOrNull;
+          if (event == null ||
+              message['direction'] != 'incoming' ||
+              CustomerVideoEvent(userId, message).fingerprint !=
+                  event.fingerprint) {
+            continue;
+          }
+          message['video_report_attempt'] = {
+            'status': 'unavailable',
+            'analysis_policy_version': customerVideoAnalysisPolicyVersion,
+            'user_id': userId,
+            'message_id': event.messageId,
+            'source_fingerprint': event.fingerprint,
+            'reason': reason,
+            'attempted_at': DateTime.now().toUtc().toIso8601String(),
+          };
+          changed = true;
+        }
+        if (changed) await _write(document, userId);
       });
 
   Future<bool> hasSimilarImageFingerprint(String userId, String fingerprint,
@@ -293,12 +467,159 @@ class ConversationFileStore {
     return false;
   }
 
+  // Legacy ID suffixes sometimes used recovery/poll time. Read the actual
+  // persisted sent_at field for event identity, not that unreliable suffix.
+  String? _mediaContentKey(String id) {
+    final match =
+        RegExp(r'^(visible-image|visible-video):([^:]+)(?::|$)').firstMatch(id);
+    return match == null ? null : '${match.group(1)}:${match.group(2)}';
+  }
+
+  Future<bool> hasCapturedMediaContent(
+      String userId, String kind, String digest) async {
+    final document = await read(userId);
+    final messages = (document?['messages'] as List<Object?>? ?? const [])
+        .whereType<Map<String, dynamic>>();
+    return messages.any((message) =>
+        message['direction'] == 'incoming' &&
+        _mediaContentKey(message['id']?.toString() ?? '') ==
+            'visible-$kind:$digest');
+  }
+
+  Future<bool> hasCapturedMediaEvent(String userId, String kind, String digest,
+      {required DateTime? sentAt}) async {
+    final document = await read(userId);
+    final messages = (document?['messages'] as List<Object?>? ?? const [])
+        .whereType<Map<String, dynamic>>();
+    return messages.any((message) =>
+        message['direction'] == 'incoming' &&
+        (_mediaContentKey(
+                (message['original_media_id'] ?? message['id'])?.toString() ??
+                    '') ==
+            'visible-$kind:$digest') &&
+        sameMediaMessageTime(
+            DateTime.tryParse(message['sent_at']?.toString() ?? ''), sentAt));
+  }
+
+  /// Event-scoped preview dedup survives scrolling/restarts. A partial preview
+  /// never suppresses a later original; a full original never downgrades to a
+  /// preview. Caller keys contain the JD message clock and attachment slot.
+  Future<bool> hasAcquiredImageEvent(String userId, String eventKey,
+      {String? previewId}) async {
+    final document = await read(userId);
+    return (document?['messages'] as List<Object?>? ?? const [])
+        .whereType<Map>()
+        .any((message) =>
+            message['direction'] == 'incoming' &&
+            ((previewId != null && message['id'] == previewId) ||
+                (message['media'] as List<Object?>? ?? const [])
+                    .whereType<Map>()
+                    .any((m) =>
+                        m['source_event_key'] == eventKey &&
+                        m['type'] == 'image' &&
+                        m['is_partial'] != true)));
+  }
+
+  /// An original image/video and a later screenshot of its poster are one
+  /// event. Exact slot keys protect other same-second attachments. Legacy
+  /// videos without keys qualify only for a single visible bubble.
+  Future<bool> hasOriginalMediaEvent(
+      String userId, DateTime sentAt, String eventKey,
+      {bool singleVisibleBubble = false}) async {
+    final document = await read(userId);
+    return (document?['messages'] as List<Object?>? ?? const [])
+        .whereType<Map>()
+        .any((m) =>
+            m['direction'] == 'incoming' &&
+            sameMediaMessageTime(
+                DateTime.tryParse(m['sent_at']?.toString() ?? ''), sentAt) &&
+            (m['media'] as List<Object?>? ?? const []).whereType<Map>().any(
+                (media) =>
+                    media['is_partial'] != true &&
+                    const ['image', 'video'].contains(media['type']) &&
+                    media['capture_source'] != 'jd_video_frame_1fps' &&
+                    (media['source_event_key'] == eventKey ||
+                        (singleVisibleBubble &&
+                            media['type'] == 'video' &&
+                            media['source_event_key'] == null))));
+  }
+
+  /// Keep a detected-but-unreadable upload distinct from older readable media.
+  /// This is capture evidence, not a new reply/transfer or a blocked queue item.
+  Future<void> recordMediaCaptureFailure(String userId, String kind,
+          {required DateTime? sentAt, required String reason}) =>
+      _serialized(userId, () async {
+        if (sentAt == null) return; // Poll time must not identify a new upload.
+        final document = await _readOrCreate(
+            userId: userId, displayName: userId, stableKey: 'customer:$userId');
+        final messages =
+            (document['messages'] as List<Object?>).whereType<Map>();
+        final alreadyReadable = messages.any((message) {
+          final at = DateTime.tryParse(message['sent_at']?.toString() ?? '');
+          return message['direction'] == 'incoming' &&
+              at != null &&
+              sameMediaMessageTime(at, sentAt) &&
+              (message['media'] as List<Object?>? ?? const [])
+                  .whereType<Map>()
+                  .any((media) =>
+                      media['type'] == kind && media['is_partial'] != true);
+        });
+        if (alreadyReadable) return;
+        final prior = document['unavailable_customer_media'];
+        if (prior is Map) {
+          final at = DateTime.tryParse(prior['sent_at']?.toString() ?? '');
+          if (at != null && at.isAfter(sentAt)) return;
+          if (at == sentAt &&
+              prior['kind'] == kind &&
+              prior['reason'] == reason) {
+            return;
+          }
+        }
+        document['unavailable_customer_media'] = {
+          'customer_id': userId,
+          'event_key': '$kind:${sentAt.toUtc().millisecondsSinceEpoch}',
+          'kind': kind,
+          'sent_at': sentAt.toUtc().toIso8601String(),
+          'reason': reason,
+          'status': 'unreadable',
+        };
+        await _write(document, userId);
+      });
+
+  /// Acquisition metadata is not a typed customer message and never advances
+  /// reply/SLA cursors. All preview variants update this same upload event.
+  Future<void> recordMediaAcquisition(
+          String userId, Map<String, Object?> event) =>
+      _serialized(userId, () async {
+        if (event['customer_id'] != userId) {
+          throw StateError('Media event owner mismatch');
+        }
+        final document = await _readOrCreate(
+            userId: userId, displayName: userId, stableKey: userId);
+        final events =
+            (document['media_acquisition_events'] as List<Object?>? ?? const [])
+                .whereType<Map>()
+                .map((e) => Map<String, Object?>.from(e))
+                .toList();
+        final index =
+            events.indexWhere((e) => e['event_key'] == event['event_key']);
+        if (index >= 0) {
+          events[index] = event;
+        } else {
+          events.add(event);
+        }
+        document['media_acquisition_events'] =
+            events.length <= 64 ? events : events.sublist(events.length - 64);
+        await _write(document, userId);
+      });
+
   /// Records the one-time SLA acknowledgement without marking the customer's
   /// request answered. The final generated reply remains independently queued.
   Future<void> appendSlaFallbackSent({
     required String userId,
     required String messageId,
     required String reply,
+    String? receiptKey,
   }) =>
       _serialized(userId, () async {
         final document = await _readOrCreate(
@@ -310,7 +631,9 @@ class ConversationFileStore {
             .cast<Map<String, Object?>>();
         if (messages.any((message) =>
             message['source'] == 'sla_fallback' &&
-            message['sla_message_id'] == messageId)) {
+            (message['sla_message_id'] == messageId ||
+                (receiptKey != null &&
+                    message['media_event_receipt'] == receiptKey)))) {
           return;
         }
         final now = DateTime.now().toUtc();
@@ -324,6 +647,7 @@ class ConversationFileStore {
           'captured_at': now.toIso8601String(),
           'source': 'sla_fallback',
           'sla_message_id': messageId,
+          if (receiptKey != null) 'media_event_receipt': receiptKey,
           'delivery_status': 'sent',
           'media': <Object?>[],
         });
@@ -598,10 +922,19 @@ class ConversationFileStore {
         final safeExtension = RegExp(r'^\.[a-z0-9]{1,8}$').hasMatch(extension)
             ? extension
             : '.bin';
-        final digest = sha256.convert(bytes).toString().substring(0, 16);
+        final digest = sha256.convert(bytes).toString();
         final path = p.join(directory.path, '$digest$safeExtension');
         final file = File(path);
-        if (!await file.exists()) await file.writeAsBytes(bytes, flush: true);
+        if (await file.exists()) {
+          if (!p.isWithin(directory.resolveSymbolicLinksSync(),
+                  file.resolveSymbolicLinksSync()) ||
+              (await sha256.bind(file.openRead()).first).toString() != digest) {
+            throw StateError(
+                'Existing media file is not owned matching content.');
+          }
+        } else {
+          await file.writeAsBytes(bytes, flush: true);
+        }
         return path;
       });
 

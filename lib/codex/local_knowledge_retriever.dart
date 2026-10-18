@@ -1,32 +1,193 @@
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math' as math;
 
 import 'package:path/path.dart' as p;
 
 import 'package_knowledge.dart';
+import 'knowledge_evidence_selection.dart';
 import 'semantic_knowledge_scorer.dart';
+import 'retrieval_topics.dart';
 
 class LocalKnowledgeRetriever {
   LocalKnowledgeRetriever(this.knowledgeDirectory,
-      {SemanticKnowledgeScorer? semanticScorer})
+      {SemanticKnowledgeScorer? semanticScorer,
+      SemanticKnowledgeScorer? secondInspectionScorer})
       : _semanticScorer =
-            semanticScorer ?? const MacOSSemanticKnowledgeScorer();
+            semanticScorer ?? const MacOSSemanticKnowledgeScorer(),
+        _secondInspectionScorer = secondInspectionScorer;
 
   final Directory knowledgeDirectory;
   final SemanticKnowledgeScorer _semanticScorer;
+  final SemanticKnowledgeScorer? _secondInspectionScorer;
   static final Map<String,
           ({String revision, Future<List<Map<String, dynamic>>> records})>
       _cache = {};
+  static final _lexicalIndexes = Expando<_KnowledgeLexicalIndex>();
 
   Future<List<Map<String, Object?>>> retrieve(String query,
       {int limit = 5,
       bool? packageContentsQuery,
+      bool includeSemanticScoring = true,
       String? currentQuestion}) async {
     final records = await _loadedRecords();
     return _retrieveFromRecords(query, records,
         limit: limit,
         packageContentsQuery: packageContentsQuery,
+        includeSemanticScoring: includeSemanticScoring,
         currentQuestion: currentQuestion);
+  }
+
+  /// Index every approved customer-KB section, independently of a query or a
+  /// customer's history. This runs ahead of second-inspection requests.
+  Future<void> prepareSecondInspectionIndex() async {
+    final scorer = _secondInspectionScorer;
+    if (scorer is IndexedSemanticKnowledgeScorer) {
+      await scorer.prepare(_secondInspectionRecords(await _loadedRecords()));
+    }
+  }
+
+  List<Map<String, dynamic>> _secondInspectionRecords(
+          List<Map<String, dynamic>> records) =>
+      records.where((record) {
+        if (!_isJdApplicable(record)) return false;
+        if (record['status'] == 'active') return true;
+        final source = (record['source_file'] ?? '').toString();
+        // The source export also contains Flutter integration/configuration
+        // notes. Those are never customer-answer evidence.
+        return source.endsWith('_kb.md') ||
+            p.basename(source) == 'customer_service_high_priority_issues.md';
+      }).toList(growable: false);
+
+  /// A real second retrieval path: no lexical cutoff, no 600-card candidate
+  /// cap, and no small semantic bonus dominated by keyword scores. Confirmed
+  /// model/category applicability is still enforced before answering.
+  Future<List<Map<String, Object?>>> retrieveFullSemantic(String query,
+      {int limit = 60}) async {
+    final scorer = _secondInspectionScorer;
+    if (scorer == null) {
+      throw const SemanticSearchUnavailable(
+          'Second-inspection semantic scorer is not configured.');
+    }
+    final eligible = await _eligibleSecondInspectionRecords(query);
+    if (eligible.isEmpty) return const [];
+    final scores = await scorer.score(retrievalQuestionText(query), eligible);
+    if (eligible.any((r) => scores[r['id']?.toString()]?.isFinite != true)) {
+      throw const SemanticSearchUnavailable(
+          'Full semantic inspection returned incomplete scores.');
+    }
+    final ordered = eligible.toList()
+      ..sort((a, b) =>
+          scores[b['id'].toString()]!.compareTo(scores[a['id'].toString()]!));
+    return ordered.take(limit).map(_compact).toList(growable: false);
+  }
+
+  Future<List<Map<String, Object?>>> filterSecondInspectionEvidence(
+      String query, List<Map<String, Object?>> candidates) async {
+    final eligible = (await _eligibleSecondInspectionRecords(query))
+        .map((r) => r['id'])
+        .toSet();
+    return candidates
+        .where((r) => eligible.contains(r['id']))
+        .toList(growable: false);
+  }
+
+  /// Expand only operation-relevant sections from already retrieved sources,
+  /// and reserve applicable universal safety procedures before truncating.
+  /// No new model call, customer history, or unverified model mapping is used.
+  Future<List<Map<String, Object?>>> selectEvidence(
+      String query, List<Map<String, Object?>> candidates,
+      {required String currentQuestion, int limit = 16}) async {
+    final eligible = await _eligibleSecondInspectionRecords(query);
+    final ids = eligible.map((r) => r['id']).toSet();
+    final filtered = candidates.where((r) => ids.contains(r['id'])).toList();
+    final topics = retrievalTopics(currentQuestion);
+    final sources = <String>{
+      for (final r in filtered) ...[
+        if (r['source_file'] != null) r['source_file'].toString(),
+        ...(r['source_files'] as List<Object?>? ?? const [])
+            .map((v) => v.toString()),
+      ],
+    };
+    final expanded = <Map<String, Object?>>[
+      ...filtered,
+      if (topics.isNotEmpty)
+        for (final record in eligible)
+          if (sources.contains(record['source_file']) &&
+              evidenceTopics(record).intersection(topics).isNotEmpty)
+            _compact(record),
+    ];
+    final policies = topics.contains('safety')
+        ? eligible
+            .where(hasUniversalSafetyProcedure)
+            .take(1)
+            .map(_compact)
+            .toList()
+        : <Map<String, Object?>>[];
+    return selectAnswerEvidence(
+        question: currentQuestion,
+        candidates: expanded,
+        mandatory: policies,
+        limit: limit);
+  }
+
+  Future<List<Map<String, dynamic>>> _eligibleSecondInspectionRecords(
+      String query) async {
+    final records = _secondInspectionRecords(await _loadedRecords());
+    final modelLine = RegExp(r'^Exact product model:\s*(.+)$', multiLine: true)
+            .firstMatch(query)
+            ?.group(1) ??
+        '';
+    final models = RegExp(r'\b[a-z]{1,5}[ -]?\d{2,5}[a-z]{0,3}\b',
+            caseSensitive: false)
+        .allMatches(modelLine)
+        .map((m) => m.group(0)!.toLowerCase().replaceAll(RegExp(r'[ -]'), ''))
+        .toSet();
+    final category =
+        RegExp(r'^Required product category:\s*(.+)$', multiLine: true)
+                .firstMatch(query)
+                ?.group(1) ??
+            '';
+    final requiredFamilies = <String>{
+      if (category.contains('thermal_label_printer')) 'thermal',
+      if (category.contains('dot_matrix_printer')) 'dot_matrix',
+      if (category.contains('attendance_machine')) 'attendance',
+    };
+    if (requiredFamilies.isEmpty && models.isNotEmpty) {
+      // Only explicit, reviewed metadata can establish a model's family.
+      // A model name mentioned in a filename/example is not classification.
+      final reviewedFamilies = <String>{};
+      for (final record in records.where((r) => r['status'] == 'active')) {
+        if (knowledgeProductModels(record['models'])
+            .intersection(models)
+            .isEmpty) {
+          continue;
+        }
+        switch (record['product_line']) {
+          case 'thermal_printer':
+            reviewedFamilies.add('thermal');
+          case 'dot_matrix_printer':
+            reviewedFamilies.add('dot_matrix');
+          case 'attendance_machine':
+            reviewedFamilies.add('attendance');
+        }
+      }
+      if (reviewedFamilies.length == 1) {
+        requiredFamilies.addAll(reviewedFamilies);
+      }
+    }
+    return records.where((record) {
+      final families = knowledgeProductFamilies(record);
+      if (requiredFamilies.isNotEmpty &&
+          families.isNotEmpty &&
+          requiredFamilies.intersection(families).isEmpty) {
+        return false;
+      }
+      final explicit = _explicitProductModels(record['models']);
+      return models.isEmpty ||
+          explicit.isEmpty ||
+          explicit.intersection(models).isNotEmpty;
+    }).toList(growable: false);
   }
 
   /// Opt-in, reviewed JD model facts remain visible regardless of phrasing.
@@ -72,6 +233,7 @@ class LocalKnowledgeRetriever {
       String query, List<Map<String, dynamic>> records,
       {required int limit,
       bool? packageContentsQuery,
+      bool includeSemanticScoring = true,
       String? currentQuestion}) async {
     final packageQuery =
         packageContentsQuery ?? hasPackageContentsIntent(query);
@@ -86,7 +248,8 @@ class LocalKnowledgeRetriever {
                 match.group(0)!.toLowerCase().replaceAll(RegExp(r'[ -]'), ''))
             .toSet();
     final packageFamilies = <String>{};
-    if (packageQuery) {
+    final modelFamilies = <String>{};
+    if (queryModels.isNotEmpty) {
       for (final record in records) {
         if (!_isJdApplicable(record)) continue;
         if (knowledgeProductModels(record['models'])
@@ -94,30 +257,88 @@ class LocalKnowledgeRetriever {
             .isNotEmpty) {
           // Exact-model metadata establishes the family. Mixed-family catalog
           // sections are not a reliable classification of an individual model.
-          final families = knowledgeProductFamilies(record);
-          if (families.length == 1) packageFamilies.addAll(families);
+          // A filename/example mentioning TP874 does not make it a needle
+          // printer. Use reviewed model metadata, as the second pass does.
+          final families = <String>{
+            if (record['status'] == 'active')
+              ...switch (record['product_line']) {
+                'thermal_printer' => {'thermal'},
+                'dot_matrix_printer' => {'dot_matrix'},
+                'attendance_machine' => {'attendance'},
+                _ => <String>{},
+              },
+          };
+          if (families.length == 1) {
+            modelFamilies.addAll(families);
+            if (packageQuery) packageFamilies.addAll(families);
+          }
         }
       }
     }
+    final categoryLine =
+        RegExp(r'^Required product category:\s*(.+)$', multiLine: true)
+                .firstMatch(query)
+                ?.group(1) ??
+            '';
+    final requiredFamilies = <String>{
+      if (categoryLine.contains('dot_matrix_printer')) 'dot_matrix',
+      if (categoryLine.contains('attendance_machine')) 'attendance',
+      if (categoryLine.contains('thermal_label_printer')) 'thermal',
+      if (categoryLine.isEmpty && modelFamilies.length == 1) ...modelFamilies,
+    };
     final scored = <({double score, Map<String, dynamic> record})>[];
+    final eligible = <Map<String, dynamic>>[];
     final expandedQuery =
         _expandEnglishTerms(query, packageQuery: packageQuery);
     final expandedQuestion = currentQuestion == null
         ? null
         : _expandEnglishTerms(currentQuestion, packageQuery: packageQuery);
+    final index = _lexicalIndexes[records] ??= _KnowledgeLexicalIndex(records);
+    final lexicalQuery =
+        currentQuestion == null || currentQuestion.trim().isEmpty
+            ? query
+            : currentQuestion;
+    // An unrecognised new question is not permission to revive an old topic.
+    final requestedTopics = retrievalTopics(lexicalQuery);
     for (final record in records) {
       if (!_isJdApplicable(record)) continue;
-      final recordModels = knowledgeProductModels(record['models']);
-      // Reject a different explicit model before semantic reranking can let
-      // it occupy one of the small number of evidence slots.
-      if (queryModels.isNotEmpty &&
-          recordModels.isNotEmpty &&
-          recordModels.intersection(queryModels).isEmpty) {
+      final families = knowledgeProductFamilies(record);
+      if (requiredFamilies.isNotEmpty &&
+          families.isNotEmpty &&
+          families.intersection(requiredFamilies).isEmpty) {
         continue;
       }
+      final explicitRecordModels = _explicitProductModels(record['models']);
+      // Reject a different explicit model before semantic reranking can let
+      // it occupy one of the small number of evidence slots. Generic family
+      // labels such as "thermal printer" remain eligible for exact-model
+      // questions because they often contain shared driver/setup guidance.
+      if (queryModels.isNotEmpty &&
+          explicitRecordModels.isNotEmpty &&
+          explicitRecordModels.intersection(queryModels).isEmpty) {
+        continue;
+      }
+      eligible.add(record);
       var score = _score(expandedQuery, record);
       if (expandedQuestion != null) {
         score += 3 * _score(expandedQuestion, record);
+      }
+      // Rare symptom terms outrank generic model/driver overlap. The existing
+      // bounded semantic scorer remains optional; no new model call is added.
+      score += 4 * index.score(lexicalQuery, record['id']?.toString() ?? '');
+      if (requestedTopics.isNotEmpty) {
+        final topics = retrievalTopics(retrievalRecordText(record));
+        final overlap = topics.intersection(requestedTopics).length;
+        score += overlap * 20;
+        final primaryTopics = retrievalTopics(
+            '${record['title'] ?? ''} ${record['issue'] ?? ''}');
+        score += primaryTopics.intersection(requestedTopics).length * 12;
+        if (requestedTopics.contains('print_speed') &&
+            RegExp(r'\d+\s*`?\s*cps\b', caseSensitive: false)
+                .hasMatch(retrievalRecordText(record))) {
+          score += 100;
+        }
+        if (overlap == 0) score *= 0.5;
       }
       if (packageQuery && isPackageContentsRecord(record)) {
         final models = knowledgeProductModels(record['models']);
@@ -149,18 +370,44 @@ class LocalKnowledgeRetriever {
       return ((right.record['priority'] as num?) ?? 0)
           .compareTo((left.record['priority'] as num?) ?? 0);
     });
-    // Keep lexical matching as the candidate gate and use local sentence
-    // similarity to rerank the strongest candidates. This bounds native work
-    // and prevents an unrelated semantic hit from replacing exact evidence.
-    final candidates =
+    // Curated cards and exact-model records are allowed into the semantic
+    // pass even when the customer used different words from the dataset.
+    // Source chunks still need lexical or exact-model support so the bounded
+    // native scorer is not flooded with loosely related raw documentation.
+    final lexicalCandidates =
         scored.take(limit > 35 ? limit : 35).toList(growable: false);
-    final semanticScores = await _semanticScorer.score(
-        expandedQuestion == null
-            ? query
-            : '$expandedQuestion ${queryModels.join(' ')}',
-        candidates.map((item) => item.record).toList(growable: false));
-    final hybrid = [
-      for (final item in candidates)
+    final semanticPool = <Map<String, dynamic>>[];
+    final semanticIds = <String>{};
+
+    void addSemanticCandidate(Map<String, dynamic> record) {
+      final id = record['id']?.toString() ?? '';
+      if (id.isEmpty || !semanticIds.add(id)) return;
+      semanticPool.add(record);
+    }
+
+    for (final item in lexicalCandidates) {
+      addSemanticCandidate(item.record);
+    }
+    final semanticOnly = eligible.where((record) {
+      final recordModels = _explicitProductModels(record['models']);
+      final exactModel = queryModels.isNotEmpty &&
+          recordModels.intersection(queryModels).isNotEmpty;
+      return exactModel || record['status'] == 'active';
+    }).toList(growable: false)
+      ..sort((left, right) => ((right['priority'] as num?) ?? 0)
+          .compareTo((left['priority'] as num?) ?? 0));
+    for (final record in semanticOnly.take(600)) {
+      addSemanticCandidate(record);
+    }
+    final semanticScores = includeSemanticScoring
+        ? await _semanticScorer.score(
+            expandedQuestion == null
+                ? query
+                : '$expandedQuestion ${queryModels.join(' ')}',
+            semanticPool)
+        : const <String, double>{};
+    final hybrid = <({double score, Map<String, dynamic> record})>[
+      for (final item in lexicalCandidates)
         (
           score: item.score +
               ((semanticScores[item.record['id']?.toString()] ?? 0) - 0.4)
@@ -169,6 +416,21 @@ class LocalKnowledgeRetriever {
           record: item.record,
         ),
     ];
+    // A strong semantic match can now rescue a reviewed record with no
+    // lexical overlap. The threshold deliberately stays conservative because
+    // these records will become customer-facing evidence.
+    final hybridIds =
+        hybrid.map((item) => item.record['id']?.toString() ?? '').toSet();
+    for (final record in semanticPool) {
+      final id = record['id']?.toString() ?? '';
+      if (hybridIds.contains(id)) continue;
+      final semantic = semanticScores[id] ?? 0;
+      if (semantic < 0.68) continue;
+      hybrid.add((
+        score: 1 + (semantic - 0.4).clamp(0.0, 1.0) * 30,
+        record: record,
+      ));
+    }
     hybrid.sort((left, right) {
       final byScore = right.score.compareTo(left.score);
       if (byScore != 0) return byScore;
@@ -178,13 +440,24 @@ class LocalKnowledgeRetriever {
     return hybrid.take(limit).map((item) => _compact(item.record)).toList();
   }
 
+  Set<String> _explicitProductModels(Object? rawModels) {
+    if (rawModels is! List) return const {};
+    final pattern = RegExp(r'^[a-z]{1,5}\d{2,5}[a-z]{0,3}$');
+    return rawModels
+        .map((model) =>
+            model.toString().toLowerCase().replaceAll(RegExp(r'[\s-]'), ''))
+        .where(pattern.hasMatch)
+        .toSet();
+  }
+
   Future<String> _knowledgeRevision() async {
     final files = <File>[
       File(p.join(knowledgeDirectory.path, 'rag_cards',
           'customer_service_rag_cards.jsonl')),
       File(p.join(knowledgeDirectory.path, 'rag_cards', 'source_chunks.jsonl')),
     ];
-    await for (final entry in knowledgeDirectory.list(followLinks: false)) {
+    await for (final entry
+        in knowledgeDirectory.list(recursive: true, followLinks: false)) {
       if (entry is File && _isCustomerKnowledgeMarkdown(entry)) {
         files.add(entry);
       }
@@ -242,9 +515,10 @@ class LocalKnowledgeRetriever {
     );
 
     // The JD knowledge package also contains source evidence and READMEs.
-    // Only root-level customer knowledge belongs in reply retrieval.
+    // Recursively include only explicitly named customer-KB Markdown files;
+    // planning notes and unrelated documentation remain excluded.
     final markdownFiles = await knowledgeDirectory
-        .list(followLinks: false)
+        .list(recursive: true, followLinks: false)
         .where((entry) => entry is File && _isCustomerKnowledgeMarkdown(entry))
         .cast<File>()
         .toList();
@@ -357,9 +631,9 @@ class LocalKnowledgeRetriever {
     if (_isProductCatalogQuery(normalizedQuery)) {
       final intent = _normalize(record['intent']?.toString() ?? '');
       final id = _normalize(record['id']?.toString() ?? '');
-      if (intent.contains('presale')) score += 18;
+      if (intent.contains('presale')) score += 30;
       if (id.contains('selling_points') || id.contains('recommend')) {
-        score += 22;
+        score += 40;
       }
     }
     if (_isTechnicalQuery(normalizedQuery)) {
@@ -506,7 +780,8 @@ class LocalKnowledgeRetriever {
     ]) {
       if (RegExp(pattern).hasMatch(lower)) terms.add(translation);
     }
-    return terms.isEmpty ? query : '$query ${terms.join(' ')}';
+    return expandRetrievalTopics(
+        terms.isEmpty ? query : '$query ${terms.join(' ')}');
   }
 
   double _termScore(String query, Object? rawTerms, double weight) {
@@ -574,27 +849,20 @@ class LocalKnowledgeRetriever {
   }
 
   Map<String, Object?> _compact(Map<String, dynamic> record) => {
-        for (final key in const [
-          'id',
-          'type',
-          'title',
-          'product_line',
-          'models',
-          'intent',
-          'issue',
-          'risk_level',
-          'auto_reply_allowed',
-          'required_slots',
-          'reply_template',
-          'actions',
-          'do_not_say',
-          'escalation',
-          'source_files',
-          'visual_evidence',
-          'source_file',
-          'content',
-        ])
-          if (record.containsKey(key) && _jdOnlyValue(record[key]) != null)
+        // Keep governed structured facts (e.g. shift group_mapping/limits).
+        // The former allowlist silently removed the actual setup instructions.
+        for (final key in record.keys)
+          if (!const {
+                'keywords',
+                'synonyms',
+                'version',
+                'package_version',
+                'platforms',
+                'current_platform',
+                'resolution_ids',
+                'always_include_for_matching_models'
+              }.contains(key) &&
+              _jdOnlyValue(record[key]) != null)
             key: _jdOnlyValue(record[key]),
       };
 
@@ -650,5 +918,67 @@ class LocalKnowledgeRetriever {
       hash = (hash * 0x100000001b3) & 0x7fffffffffffffff;
     }
     return hash.toRadixString(16).padLeft(16, '0');
+  }
+}
+
+/// Cached per dataset revision, not per customer. Contains only approved KB
+/// text; customer messages/media never enter this shared index.
+class _KnowledgeLexicalIndex {
+  _KnowledgeLexicalIndex(List<Map<String, dynamic>> records) {
+    for (final record in records) {
+      final id = record['id']?.toString() ?? '';
+      if (id.isEmpty) continue;
+      final tokens = _tokens(retrievalRecordText(record));
+      final frequencies = <String, int>{};
+      for (final token in tokens) {
+        frequencies.update(token, (count) => count + 1, ifAbsent: () => 1);
+      }
+      _documents[id] = frequencies;
+      _lengths[id] = tokens.length;
+      for (final term in frequencies.keys) {
+        _documentFrequency.update(term, (count) => count + 1,
+            ifAbsent: () => 1);
+      }
+    }
+    _averageLength = _lengths.isEmpty
+        ? 1
+        : _lengths.values.fold<int>(0, (sum, n) => sum + n) / _lengths.length;
+  }
+
+  final _documents = <String, Map<String, int>>{};
+  final _documentFrequency = <String, int>{};
+  final _lengths = <String, int>{};
+  late final double _averageLength;
+
+  static List<String> _tokens(String text) {
+    final tokens = <String>[];
+    for (final match in RegExp(r'[a-z0-9]+|[\u3400-\u9fff]+')
+        .allMatches(text.toLowerCase())) {
+      final term = match.group(0)!;
+      if (RegExp(r'^[a-z0-9]').hasMatch(term)) {
+        if (term.length > 1) tokens.add(term);
+      } else {
+        for (var i = 0; i + 1 < term.length; i++) {
+          tokens.add(term.substring(i, i + 2));
+        }
+      }
+    }
+    return tokens;
+  }
+
+  double score(String query, String id) {
+    final document = _documents[id];
+    if (document == null || _averageLength <= 0) return 0;
+    var total = 0.0;
+    for (final term in _tokens(query).toSet()) {
+      final tf = document[term] ?? 0;
+      if (tf == 0) continue;
+      final df = _documentFrequency[term] ?? 0;
+      final idf = math.log(1 + (_documents.length - df + 0.5) / (df + 0.5));
+      total += idf *
+          (tf * 2.2) /
+          (tf + 1.2 * (0.25 + 0.75 * (_lengths[id] ?? 0) / _averageLength));
+    }
+    return total;
   }
 }

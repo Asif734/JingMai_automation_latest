@@ -98,6 +98,8 @@ printf '%s\\n' '{"reply":"可以，TD630支持六联，四联可以打印。","d
               stableId: 'a$index',
               direction: 'outgoing',
               body: '请用Windows通用驱动，USB连接，步骤$index',
+              sentAt: DateTime.utc(2026, 10, 18, 1, index),
+              deliveryConfirmed: true,
               axPath: 'test'),
         ],
         const CapturedMessage(

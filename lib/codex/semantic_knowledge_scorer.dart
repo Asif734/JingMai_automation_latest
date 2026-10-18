@@ -3,10 +3,8 @@ import 'dart:io';
 
 import 'package:flutter/services.dart';
 
-abstract class SemanticKnowledgeScorer {
-  Future<Map<String, double>> score(
-      String query, List<Map<String, dynamic>> records);
-}
+import 'semantic_scoring.dart';
+export 'semantic_scoring.dart';
 
 /// Uses macOS NaturalLanguage sentence embeddings. The lexical retriever
 /// remains authoritative when the native service is unavailable or slow.

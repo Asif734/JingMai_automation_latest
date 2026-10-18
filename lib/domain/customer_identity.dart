@@ -140,6 +140,32 @@ bool customerSenderLabelMatches(String value, String customer) {
   if (!raw.startsWith('$expected ')) return false;
   final suffix = raw.substring(expected.length).trim();
   return RegExp(
-          r'^(?:20\d{2}[-/.]\d{1,2}[-/.]\d{1,2}\s+)?\d{1,2}:\d{2}(?::\d{2})?$')
+          r'^(?:(?:20\d{2}[-/.])?\d{1,2}[-/.]\d{1,2}\s+)?\d{1,2}:\d{2}(?::\d{2})?$')
       .hasMatch(suffix);
+}
+
+/// Repairs OCR text only; it never repairs an AX identity or establishes an
+/// alias. A unique saved customer AND an independently verified AX header must
+/// agree. A different real saved account always wins over fuzzy similarity.
+String reconcileOcrCustomerSenderLabel({
+  required String observedLabel,
+  required String verifiedAxCustomer,
+  required Iterable<String> trustedCustomers,
+}) {
+  final match = RegExp(
+    r'^(jd_[A-Za-z0-9]{8,})(\s+(?:(?:20\d{2}[-/.])?\d{1,2}[-/.]\d{1,2}\s+)?\d{1,2}:\d{2}(?::\d{2})?)?$',
+  ).firstMatch(observedLabel.trim());
+  if (match == null) return observedLabel;
+  final observed = match.group(1)!;
+  final saved = trustedCustomers.map((id) => id.trim()).toSet();
+  if (!saved.contains(verifiedAxCustomer) || saved.contains(observed)) {
+    return observedLabel;
+  }
+  final resolution = resolveObservedCustomerIdentity(observed, saved);
+  if (resolution.kind !=
+          CustomerIdentityResolutionKind.uniqueTrustedNearMatch ||
+      !customerIdentitiesMatch(resolution.customer, verifiedAxCustomer)) {
+    return observedLabel;
+  }
+  return '$verifiedAxCustomer${match.group(2) ?? ''}';
 }

@@ -335,8 +335,12 @@ void main() {
       final arguments = call.arguments! as Map<Object?, Object?>;
       expect(arguments['expectedCustomer'], '上海胜价信息技术');
       expect(arguments['expectedMediaAtMs'], expectedAt.millisecondsSinceEpoch);
+      expect(arguments['sourcePngBase64'], 'AQID');
+      expect(arguments['sourceSenderY'], .25);
       return <String, Object?>{
         'kind': 'image',
+        'verifiedCustomerId': '上海胜价信息技术',
+        'ownershipVerification': 'visible_customer_region',
         'mimeType': 'image/png',
         'extension': 'png',
         'originalName': 'cached-original.png',
@@ -356,6 +360,17 @@ void main() {
       width: .2,
       height: .3,
       expectedMediaAt: expectedAt,
+      sourceInspection: OcrInspection(
+          image: Uint8List.fromList([1, 2, 3]),
+          imageWidth: 1000,
+          imageHeight: 1000,
+          windowTitle: 'JD',
+          recognizedText: '',
+          observations: const [],
+          capturedAt: expectedAt,
+          windowId: 7,
+          activeCustomerId: '上海胜价信息技术'),
+      sourceSenderY: .25,
     );
 
     expect(image.captureSource, 'jd-image-cache');
@@ -363,20 +378,25 @@ void main() {
     expect(image.bytes, <int>[1, 2, 3]);
   });
 
-  test('checks the cache directly for a new customer turn', () async {
+  test('cache discovery never returns assignable bytes or a copied file',
+      () async {
     final expectedAt = DateTime.utc(2026, 9, 24, 6, 0, 2);
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
         .setMockMethodCallHandler(channel, (call) async {
-      expect(call.method, 'captureRecentCachedMedia');
+      expect(call.method, 'probeRecentCachedMedia');
       final arguments = call.arguments! as Map<Object?, Object?>;
       expect(arguments['expectedCustomer'], 'customer-a');
       expect(arguments['expectedMediaAtMs'], expectedAt.millisecondsSinceEpoch);
-      expect(arguments['destinationDirectory'], '/private/media/videos');
+      expect(arguments.containsKey('destinationDirectory'), isFalse);
       return <String, Object?>{
         'kind': 'image',
+        'candidateFound': true,
+        'verifiedCustomerId': 'customer-a',
         'cacheKey': 'cache-key-1',
         'cacheModifiedAtMs':
             expectedAt.add(const Duration(seconds: 1)).millisecondsSinceEpoch,
+        'cacheSelectionAmbiguous': true,
+        'cacheCandidateCount': 3,
         'mimeType': 'image/png',
         'extension': 'png',
         'originalName': 'pale-image.png',
@@ -388,16 +408,123 @@ void main() {
     final adapter = MacOSCaptureAdapter(channel: channel);
     addTearDown(adapter.close);
 
-    final media = await adapter.captureRecentCachedMedia(
+    final media = await adapter.probeRecentCachedMedia(
       expectedCustomer: 'customer-a',
       expectedMediaAt: expectedAt,
-      destinationDirectory: '/private/media/videos',
     );
 
-    expect(media, isNotNull);
-    expect(media!.cacheKey, 'cache-key-1');
-    expect(media.image?.originalName, 'pale-image.png');
-    expect(media.video, isNull);
+    expect(media['candidateFound'], isTrue);
+    expect(media['cacheSelectionAmbiguous'], isTrue);
+    expect(media['cacheCandidateCount'], 3);
+    expect(media.containsKey('dataBase64'), isFalse);
+    expect(media.containsKey('path'), isFalse);
+    expect(media.containsKey('cacheKey'), isFalse);
+  });
+
+  test('passes the customer turn time when matching a cached video', () async {
+    final expectedAt = DateTime.utc(2026, 9, 24, 6, 1, 7);
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(channel, (call) async {
+      expect(call.method, 'downloadVideoAt');
+      final arguments = call.arguments! as Map<Object?, Object?>;
+      expect(arguments['expectedCustomer'], 'customer-video');
+      expect(arguments['expectedMediaAtMs'], expectedAt.millisecondsSinceEpoch);
+      expect(arguments['sourcePngBase64'], 'BAUG');
+      expect(arguments['sourceSenderY'], .25);
+      return <String, Object?>{
+        'kind': 'video',
+        'verifiedCustomerId': 'customer-video',
+        'ownershipVerification': 'visible_customer_region',
+        'path': '/private/media/customer-video.mp4',
+        'originalName': 'customer-video.mp4',
+        'mimeType': 'video/mp4',
+      };
+    });
+    final adapter = MacOSCaptureAdapter(channel: channel);
+    addTearDown(adapter.close);
+
+    final video = await adapter.downloadVideoAt(
+      expectedCustomer: 'customer-video',
+      windowId: 7,
+      x: .2,
+      y: .3,
+      width: .2,
+      height: .3,
+      expectedMediaAt: expectedAt,
+      destinationDirectory: '/private/media',
+      sourceInspection: OcrInspection(
+          image: Uint8List.fromList([4, 5, 6]),
+          imageWidth: 1000,
+          imageHeight: 1000,
+          windowTitle: 'JD',
+          recognizedText: '',
+          observations: const [],
+          capturedAt: expectedAt,
+          windowId: 7,
+          activeCustomerId: 'customer-video'),
+      sourceSenderY: .25,
+    );
+
+    expect(video.originalName, 'customer-video.mp4');
+  });
+
+  test('media coordinates cannot borrow another customer or window snapshot',
+      () async {
+    var nativeCalls = 0;
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(channel, (call) async {
+      nativeCalls++;
+      return {};
+    });
+    final adapter = MacOSCaptureAdapter(channel: channel);
+    addTearDown(adapter.close);
+    for (final source in [
+      OcrInspection(
+          image: Uint8List.fromList([1]),
+          imageWidth: 10,
+          imageHeight: 10,
+          windowTitle: 'JD',
+          recognizedText: '',
+          observations: const [],
+          capturedAt: DateTime.now(),
+          windowId: 7,
+          activeCustomerId: 'another-buyer'),
+      OcrInspection(
+          image: Uint8List.fromList([1]),
+          imageWidth: 10,
+          imageHeight: 10,
+          windowTitle: 'JD',
+          recognizedText: '',
+          observations: const [],
+          capturedAt: DateTime.now(),
+          windowId: 8,
+          activeCustomerId: 'customer-video')
+    ]) {
+      await expectLater(
+          adapter.captureImageRegion(
+              expectedCustomer: 'customer-video',
+              windowId: 7,
+              x: .2,
+              y: .3,
+              width: .2,
+              height: .3,
+              sourceInspection: source),
+          throwsA(isA<PlatformException>()
+              .having((e) => e.code, 'code', 'media_source_owner_unverified')));
+      await expectLater(
+          adapter.downloadVideoAt(
+              expectedCustomer: 'customer-video',
+              windowId: 7,
+              x: .2,
+              y: .3,
+              width: .2,
+              height: .3,
+              sourceInspection: source,
+              destinationDirectory: '/private/media'),
+          throwsA(isA<PlatformException>()
+              .having((e) => e.code, 'code', 'media_source_owner_unverified')));
+    }
+    expect(nativeCalls, 0);
   });
 
   test('waits for the requested customer before returning OCR', () async {

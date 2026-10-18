@@ -12,7 +12,7 @@ void main() {
         '你说“请给我们一点时间核对详情。”是什么意思？');
   });
   test('holding replies vary but always use Chinese', () {
-    expect(chineseHoldingReplies.toSet(), hasLength(20));
+    expect(chineseHoldingReplies.toSet(), hasLength(30));
     final random = Random(7);
     for (var index = 0; index < 30; index++) {
       expect(
@@ -22,5 +22,19 @@ void main() {
       expect(chineseHoldingReplies,
           contains(chooseHoldingReply('这个型号有什么功能？', random: random)));
     }
+  });
+
+  test('support fallbacks stay positive and preserve customer effort', () {
+    expect(positiveSupportFallbackReplies.toSet(), hasLength(6));
+    for (final reply in positiveSupportFallbackReplies) {
+      expect(
+          reply,
+          anyOf(contains('已收到'), contains('感谢'), contains('抱歉'),
+              contains('您的问题')));
+      expect(reply, anyOf(contains('保留'), contains('继续'), contains('跟进')));
+      expect(reply, isNot(contains('无法处理')));
+    }
+    expect(choosePositiveSupportFallback('same customer'),
+        choosePositiveSupportFallback('same customer'));
   });
 }

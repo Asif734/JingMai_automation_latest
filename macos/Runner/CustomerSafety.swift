@@ -1,5 +1,7 @@
 import Foundation
 import CoreGraphics
+import ImageIO
+import CryptoKit
 
 /// A thread-local, nestable budget for native AX work. A timed-out read poisons
 /// its entire snapshot; incomplete identity evidence must never authorize input.
@@ -40,6 +42,120 @@ final class AccessibilityBudget {
 
 /// Identity evidence is never repaired using OCR lookalikes or prefixes.
 enum CustomerSafety {
+  struct AttachmentMenuLine {
+    let text: String
+    let confidence: Float
+    let frame: CGRect
+  }
+
+  /// Low-confidence icon+label OCR is acceptable only as one complete, ordered
+  /// four-row attachment menu. Never authorize a click from a substring alone.
+  static func attachmentSaveTarget(_ lines: [AttachmentMenuLine]) -> CGRect? {
+    let labels = ["举报", "另存为", "引用", "多选"]
+    var rows: [AttachmentMenuLine] = []
+    for label in labels {
+      let matches = lines.filter { $0.confidence >= 0.25 && mediaMenuLabel($0.text) == label }
+      guard matches.count == 1 else { return nil }
+      rows.append(matches[0])
+    }
+    let gaps = (1..<rows.count).map { rows[$0].frame.midY - rows[$0 - 1].frame.midY }
+    guard let smallest = gaps.min(), let largest = gaps.max(),
+          smallest >= 12, largest <= 200, largest <= smallest * 1.65 else { return nil }
+    let xs = rows.map { $0.frame.minX }
+    guard (xs.max()! - xs.min()!) < largest * 1.6,
+          rows.allSatisfy({ $0.frame.width > 8 && $0.frame.width < largest * 7 }) else { return nil }
+    return rows[1].frame
+  }
+
+  static func safeAttachmentFilename(_ raw: String) -> String? {
+    let name = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !name.isEmpty, name.utf8.count <= 180, !name.hasPrefix("."),
+          !name.contains("/"), !name.contains("\\"), !name.contains(":"),
+          !name.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains) else { return nil }
+    let ext = (name as NSString).pathExtension.lowercased()
+    guard ext.isEmpty || ["jpg", "jpeg", "png", "webp", "gif", "heic", "mp4", "mov", "m4v", "webm"].contains(ext) else { return nil }
+    return name
+  }
+
+  static func attachmentFilenameMatches(_ actual: String, expected: String) -> Bool {
+    guard safeAttachmentFilename(expected) != nil, safeAttachmentFilename(actual) != nil else { return false }
+    if actual == expected { return true }
+    return (expected as NSString).pathExtension.isEmpty &&
+      (actual as NSString).deletingPathExtension == expected
+  }
+
+  /// Detect the actual payload, never a thumbnail's colour or filename suffix.
+  /// A container still needs a real video stream before it becomes a video.
+  static func attachmentContainerKind(_ bytes: Data) -> String? {
+    if let source = CGImageSourceCreateWithData(bytes as CFData, nil),
+       CGImageSourceGetStatus(source) == .statusComplete,
+       CGImageSourceGetCount(source) > 0,
+       CGImageSourceCreateImageAtIndex(source, 0, nil) != nil { return "image" }
+    guard bytes.count >= 12 else { return nil }
+    let box = String(data: bytes.subdata(in: 4..<8), encoding: .ascii)
+    if ["ftyp", "moov", "mdat", "wide"].contains(box ?? "") ||
+        Array(bytes.prefix(4)) == [0x1a, 0x45, 0xdf, 0xa3] { return "video_container" }
+    return nil
+  }
+
+  /// The old cache-first receive window, with cross-turn ambiguity rejection.
+  /// Do not use the newest file or a cache modified clock as the message ID.
+  static func cacheVideoClockMatches(modified: Date, expected: Date, now: Date,
+                                    competing: [Date]) -> Bool {
+    let offset = modified.timeIntervalSince(expected)
+    let age = now.timeIntervalSince(modified)
+    guard offset >= -5, offset <= 60, age >= -5, age <= 5 * 60 else { return false }
+    let delta = abs(offset)
+    return !competing.contains { abs(modified.timeIntervalSince($0)) <= delta + 3 }
+  }
+
+  /// The accessory workbench can share activation with its verified JingMai
+  /// launcher. Parent activation alone is never permission to click: the hit
+  /// window must still belong to the exact workbench process.
+  static func mediaReferenceForeground(workbenchPID: Int32, launcherPID: Int32?,
+      frontmostPID: Int32?, hitPID: Int32?, hitExpectedWindow: Bool,
+      hitOwnedMenu: Bool = false, allowOwnedOverlay: Bool = false) -> Bool {
+    guard let frontmostPID, workbenchPID > 0,
+          hitPID == workbenchPID,
+          frontmostPID == workbenchPID || frontmostPID == launcherPID else { return false }
+    return hitExpectedWindow || (allowOwnedOverlay && hitOwnedMenu)
+  }
+
+  /// Coordinates belong to the OCR screenshot, not merely to a customer ID.
+  /// Check the entire strip from its sender through the media so a scroll,
+  /// inserted warning/reply, resize, or changed thumbnail requires fresh OCR.
+  static func mediaSnapshotMatches(source: CGImage, current: CGImage,
+                                   region: CGRect, senderY: Double?) -> Bool {
+    guard source.width == current.width, source.height == current.height,
+          region.width >= 40, region.height >= 40,
+          region.minX >= 0, region.minY >= 0,
+          region.maxX <= CGFloat(source.width), region.maxY <= CGFloat(source.height)
+    else { return false }
+    let anchor = senderY.map { CGFloat($0) * CGFloat(source.height) } ?? region.minY - 80
+    guard anchor >= 0, anchor <= region.minY else { return false }
+    let x = max(0, region.minX - 16)
+    let y = max(0, anchor - 8)
+    let proof = CGRect(x: x, y: y,
+      width: min(CGFloat(source.width) - x, max(region.width + 16, 600)),
+      height: region.maxY - y).integral
+    guard let a = source.cropping(to: proof), let b = current.cropping(to: proof) else { return false }
+    func pixels(_ image: CGImage) -> Data? {
+      let stride = image.width * 4
+      var data = Data(count: stride * image.height)
+      let rendered = data.withUnsafeMutableBytes { bytes -> Bool in
+        guard let context = CGContext(data: bytes.baseAddress, width: image.width,
+          height: image.height, bitsPerComponent: 8, bytesPerRow: stride,
+          space: CGColorSpaceCreateDeviceRGB(),
+          bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return false }
+        context.draw(image, in: CGRect(x: 0, y: 0, width: image.width, height: image.height))
+        return true
+      }
+      return rendered ? data : nil
+    }
+    guard let aBytes = pixels(a), let bBytes = pixels(b) else { return false }
+    return aBytes == bBytes
+  }
+
   struct HeaderLabel {
     let text: String
     let frame: CGRect
@@ -147,6 +263,214 @@ enum CustomerSafety {
     return Set(digests).count == 1 ? digests.first : nil
   }
 
+  enum PairedVideoCacheMatch {
+    case matched(URL)
+    case notFound
+    case unresolved(String)
+  }
+
+  /// The native Save As panel supplies the exact name of the selected message,
+  /// independently of preview contrast. Never accept a path, partial name, or
+  /// a timestamp-derived guess from the account-wide cache.
+  static func videoCacheStem(saveAsName: String) -> String? {
+    mediaCacheStem(saveAsName: saveAsName, extensions: ["mp4", "mov", "m4v", "webm"])
+  }
+
+  static func mediaCacheStem(saveAsName: String,
+                            extensions: Set<String> = ["mp4", "mov", "m4v", "webm", "jpg", "jpeg", "png", "webp"]) -> String? {
+    let name = saveAsName.trimmingCharacters(in: .whitespacesAndNewlines)
+    let ext = (name as NSString).pathExtension.lowercased()
+    guard ext.isEmpty || extensions.contains(ext) else { return nil }
+    let stem = (name as NSString).deletingPathExtension.lowercased()
+    guard stem.range(of: #"^(?:[a-f0-9]{32}|[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})$"#,
+                     options: .regularExpression) != nil else { return nil }
+    return stem.replacingOccurrences(of: "-", with: "")
+  }
+
+  /// OCR sometimes includes the adjacent menu icon in the same observation.
+  /// Accept only a known label with bounded control glyphs, never arbitrary
+  /// substrings from the underlying customer conversation.
+  static func mediaMenuLabel(_ raw: String) -> String? {
+    let value = raw.filter { !$0.isWhitespace }
+    let controls = CharacterSet(charactersIn: "□▣回◎口日目同囧三④③②①鱼苎☐☑🔖…⋯")
+      .union(.symbols).union(.punctuationCharacters)
+    for label in ["另存为", "举报", "引用", "多选", "添加到表情", "复制"] {
+      guard let range = value.range(of: label) else { continue }
+      let remainder = String(value[..<range.lowerBound]) + String(value[range.upperBound...])
+      if remainder.count <= 3 && remainder.unicodeScalars.allSatisfy({ controls.contains($0) }) {
+        return label
+      }
+    }
+    return nil
+  }
+
+  static func referencedCachedVideo(saveAsName: String, candidates: [URL],
+                                    deadline: TimeInterval) -> PairedVideoCacheMatch {
+    guard let stem = videoCacheStem(saveAsName: saveAsName) else {
+      return .unresolved("video_message_reference_invalid")
+    }
+    let keys: Set<URLResourceKey> = [
+      .isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey, .contentModificationDateKey,
+    ]
+    var matches: [(URL, String)] = []
+    for url in candidates {
+      guard ProcessInfo.processInfo.systemUptime < deadline else {
+        return .unresolved("video_cache_check_timeout")
+      }
+      let parent = url.deletingLastPathComponent()
+      guard parent.lastPathComponent == "videos",
+            parent.deletingLastPathComponent().lastPathComponent.hasPrefix("chat_"),
+            videoCacheStem(saveAsName: url.lastPathComponent) == stem,
+            ["mp4", "mov", "m4v", "webm"].contains(url.pathExtension.lowercased()),
+            url.resolvingSymlinksInPath().deletingLastPathComponent() == parent.standardizedFileURL,
+            let before = try? url.resourceValues(forKeys: keys),
+            before.isRegularFile == true, before.isSymbolicLink != true,
+            let size = before.fileSize, size > 0, size <= 100 * 1024 * 1024,
+            let modified = before.contentModificationDate else { continue }
+      guard let bytes = try? Data(contentsOf: url), bytes.count == size,
+            let after = try? url.resourceValues(forKeys: keys),
+            after.fileSize == size, after.contentModificationDate == modified else {
+        return .unresolved("video_cache_changed_during_check")
+      }
+      matches.append((url, SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()))
+      if uniqueVideoDigest(matches.map { $0.1 }) == nil {
+        return .unresolved("video_message_reference_ambiguous")
+      }
+    }
+    guard ProcessInfo.processInfo.systemUptime < deadline else {
+      return .unresolved("video_cache_check_timeout")
+    }
+    guard let first = matches.first else { return .notFound }
+    return .matched(first.0)
+  }
+
+  /// Restore cache-first acquisition without assigning the newest shared-cache
+  /// file to whichever customer happens to be open. JD's JPEG and original MP4
+  /// share a basename within ONE chat bucket. Match that JPEG to the verified
+  /// sender's visible bubble, then copy the paired original, not a re-encoded
+  /// frame. Cache clocks only bound discovery; they never establish ownership.
+  static func pairedCachedVideo(visible: CGImage, candidates: [URL],
+                                deadline: TimeInterval) -> PairedVideoCacheMatch {
+    let keys: Set<URLResourceKey> = [
+      .isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey, .contentModificationDateKey,
+    ]
+    var matches: [(URL, String)] = []
+    for video in candidates {
+      guard ProcessInfo.processInfo.systemUptime < deadline else {
+        return .unresolved("video_cache_check_timeout")
+      }
+      let bucket = video.deletingLastPathComponent().deletingLastPathComponent()
+      guard video.deletingLastPathComponent().lastPathComponent == "videos",
+            bucket.lastPathComponent.hasPrefix("chat_"),
+            video.resolvingSymlinksInPath().deletingLastPathComponent() ==
+              bucket.appendingPathComponent("videos").standardizedFileURL,
+            let before = try? video.resourceValues(forKeys: keys),
+            before.isRegularFile == true, before.isSymbolicLink != true,
+            let size = before.fileSize, size > 0, size <= 100 * 1024 * 1024,
+            let modified = before.contentModificationDate else { continue }
+      let imageDirectory = bucket.appendingPathComponent("images", isDirectory: true)
+      let stem = video.deletingPathExtension().lastPathComponent
+      var paired = false
+      for ext in ["jpg", "jpeg", "png", "webp"] {
+        guard ProcessInfo.processInfo.systemUptime < deadline else {
+          return .unresolved("video_cache_check_timeout")
+        }
+        let thumbnail = imageDirectory.appendingPathComponent("\(stem).\(ext)")
+        guard thumbnail.resolvingSymlinksInPath().deletingLastPathComponent() == imageDirectory,
+              let thumbBefore = try? thumbnail.resourceValues(forKeys: keys),
+              thumbBefore.isRegularFile == true, thumbBefore.isSymbolicLink != true,
+              let thumbSize = thumbBefore.fileSize, thumbSize > 0, thumbSize <= 5 * 1024 * 1024,
+              let thumbModified = thumbBefore.contentModificationDate,
+              let source = CGImageSourceCreateWithURL(thumbnail as CFURL, nil),
+              let image = CGImageSourceCreateThumbnailAtIndex(source, 0, [
+                kCGImageSourceCreateThumbnailFromImageAlways: true,
+                kCGImageSourceCreateThumbnailWithTransform: true,
+                kCGImageSourceThumbnailMaxPixelSize: 512,
+              ] as CFDictionary),
+              cachedThumbnailMatches(visible, image) else { continue }
+        guard let thumbAfter = try? thumbnail.resourceValues(forKeys: keys),
+              thumbAfter.fileSize == thumbSize,
+              thumbAfter.contentModificationDate == thumbModified else {
+          return .unresolved("video_cache_changed_during_check")
+        }
+        paired = true
+        break
+      }
+      guard paired else { continue }
+      guard let bytes = try? Data(contentsOf: video), bytes.count == size,
+            let after = try? video.resourceValues(forKeys: keys),
+            after.fileSize == size, after.contentModificationDate == modified else {
+        return .unresolved("video_cache_changed_during_check")
+      }
+      let digest = SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()
+      matches.append((video, digest))
+      if uniqueVideoDigest(matches.map { $0.1 }) == nil {
+        return .unresolved("video_cache_match_ambiguous")
+      }
+    }
+    guard ProcessInfo.processInfo.systemUptime < deadline else {
+      return .unresolved("video_cache_check_timeout")
+    }
+    guard let first = matches.first else { return .notFound }
+    return .matched(first.0)
+  }
+
+  /// JD stretches/dims its cached thumbnail and overlays a play control. Match
+  /// detailed spatial structure with a bounded brightness correction instead
+  /// of requiring the JPEG to equal one decoded MP4 frame. No time-only match.
+  static func cachedThumbnailMatches(_ visible: CGImage, _ cached: CGImage) -> Bool {
+    func signature(_ image: CGImage) -> [Double]? {
+      guard let pixels = rgbaPixels(image, width: 48, height: 48) else { return nil }
+      var result: [Double] = []
+      for y in 1..<11 {
+        for x in 1..<11 where !(4...7 ~= x && 4...7 ~= y) {
+          for channel in 0..<3 {
+            var total = 0
+            for py in (y * 4)..<(y * 4 + 4) {
+              for px in (x * 4)..<(x * 4 + 4) {
+                total += Int(pixels[(py * 48 + px) * 4 + channel])
+              }
+            }
+            result.append(Double(total) / 16)
+          }
+        }
+      }
+      guard let lo = result.min(), let hi = result.max(), hi - lo >= 35 else { return nil }
+      return result
+    }
+    guard let reference = signature(cached) else { return false }
+    var previews = [visible]
+    if let crop = mediaPreviewCrop(visible) { previews.append(crop) }
+    for preview in previews {
+      let ratioA = Double(preview.width) / Double(max(1, preview.height))
+      let ratioB = Double(cached.width) / Double(max(1, cached.height))
+      guard abs(log(ratioA / ratioB)) <= 0.8,
+            let observed = signature(preview) else { continue }
+      var errors: [Double] = []
+      var valid = true
+      for channel in 0..<3 {
+        let a = stride(from: channel, to: reference.count, by: 3).map { reference[$0] }
+        let b = stride(from: channel, to: observed.count, by: 3).map { observed[$0] }
+        let meanA = a.reduce(0, +) / Double(a.count)
+        let meanB = b.reduce(0, +) / Double(b.count)
+        let varianceA = a.map { pow($0 - meanA, 2) }.reduce(0, +)
+        let varianceB = b.map { pow($0 - meanB, 2) }.reduce(0, +)
+        let covariance = zip(a, b).map { ($0 - meanA) * ($1 - meanB) }.reduce(0, +)
+        guard varianceA / Double(a.count) >= 100,
+              varianceB / Double(b.count) >= 64 else { valid = false; break }
+        let gain = covariance / varianceA
+        let offset = meanB - gain * meanA
+        let correlation = covariance / sqrt(varianceA * varianceB)
+        guard gain >= 0.65, gain <= 1.35, abs(offset) <= 45,
+              correlation >= 0.98 else { valid = false; break }
+        errors.append(contentsOf: zip(a, b).map { abs(gain * $0 + offset - $1) })
+      }
+      if valid && !errors.isEmpty && errors.reduce(0, +) / Double(errors.count) <= 5 &&
+          errors.filter({ $0 > 18 }).count <= 6 { return true }
+    }
+    return false
+  }
+
   // Ignore the central play overlay, but require detailed, closely matching
   // colour evidence elsewhere. Flat placeholder thumbnails are not evidence.
   static func videoSignature(_ image: CGImage) -> [Double]? {
@@ -187,6 +511,36 @@ enum CustomerSafety {
     let differences = zip(a, b).map { abs($0 - $1) }
     return differences.reduce(0, +) / Double(a.count) <= 12 &&
       differences.filter { $0 > 35 }.count <= 2
+  }
+
+  /// A retained preview is visible evidence, NOT ownership of a shared-cache
+  /// original or proof of image vs video. The caller must independently prove
+  /// the sender, timestamp, actual rectangle and unchanged window snapshot.
+  /// Flat white/grey/black is allowed when there are no words. With words,
+  /// require structure outside them rather than saving a plain typed bubble.
+  static func attachmentPreviewHasVisualEvidence(_ image: CGImage,
+                                                  textRegions: [CGRect]) -> Bool {
+    guard image.width >= 40, image.height >= 40 else { return false }
+    if textRegions.isEmpty { return true }
+    let size = 64
+    guard let pixels = rgbaPixels(image, width: size, height: size) else { return false }
+    let masks = textRegions.map { $0.insetBy(dx: -0.025, dy: -0.025) }
+    var samples: [[Double]] = []
+    for y in 5..<59 { for x in 5..<59 {
+      let point = CGPoint(x: (Double(x) + 0.5) / Double(size),
+                          y: (Double(y) + 0.5) / Double(size))
+      if masks.contains(where: { $0.contains(point) }) { continue }
+      let p = (y * size + x) * 4
+      samples.append((0..<3).map { Double(pixels[p + $0]) })
+    } }
+    guard samples.count >= 100 else { return false }
+    let median = (0..<3).map { channel in
+      samples.map { $0[channel] }.sorted()[samples.count / 2]
+    }
+    let background = samples.filter { sample in
+      (0..<3).allSatisfy { abs(sample[$0] - median[$0]) <= 18 }
+    }.count
+    return Double(background) / Double(samples.count) < 0.90
   }
 
   /// Isolate a single photographic preview from an over-wide OCR crop. Text,

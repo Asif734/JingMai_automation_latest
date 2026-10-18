@@ -60,6 +60,7 @@ Future<void> main(List<String> args) async {
   final dependencyEdges = <String, Map<String, String>>{};
   final cellarRoots = <String>{};
   final queue = <String>[];
+  final inheritedRunPaths = <String>{};
 
   Future<String> copyBinary(String source, {bool executable = false}) async {
     final known = originals[source];
@@ -84,11 +85,27 @@ Future<void> main(List<String> args) async {
     if (cellar >= 0 && parts.length > cellar + 2) {
       cellarRoots.add(p.joinAll(parts.take(cellar + 3)));
     }
+    if (p.basename(real).startsWith('libggml.')) {
+      // Current llama.cpp loads CPU/Metal/Accelerate backends dynamically;
+      // they do not appear in `otool -L` and must travel with the runtime.
+      final plugins = Directory(p.join(p.dirname(p.dirname(real)), 'libexec'));
+      if (await plugins.exists()) {
+        await for (final plugin in plugins.list(followLinks: false)) {
+          if (plugin is File &&
+              RegExp(r'^libggml-(?:cpu|metal|blas).*\.so$')
+                  .hasMatch(p.basename(plugin.path))) {
+            await copyBinary(plugin.path);
+          }
+        }
+      }
+    }
     return target;
   }
 
-  for (final name in ['ffmpeg', 'ffprobe']) {
-    final configured = Platform.environment['JD_${name.toUpperCase()}'];
+  for (final name in ['ffmpeg', 'ffprobe', 'llama-server']) {
+    final configured = Platform.environment[name == 'llama-server'
+        ? 'JD_LLAMA_SERVER'
+        : 'JD_${name.toUpperCase()}'];
     final candidates = [
       if (configured != null) configured,
       '/opt/homebrew/bin/$name',
@@ -103,15 +120,22 @@ Future<void> main(List<String> args) async {
     }
     if (source == null) {
       throw StateError(
-          '$name is needed on the build Mac for standalone video support.');
+          '$name is needed on the build Mac for standalone media/Qwen support.');
     }
     await copyBinary(source, executable: true);
+    final real = await File(source).resolveSymbolicLinks();
+    inheritedRunPaths
+        .addAll(machORunPaths(real, await run('otool', ['-l', real])));
   }
   for (var i = 0; i < queue.length; i++) {
     final source = queue[i];
     final target = realTargets[source]!;
     final edges = <String, String>{};
     final listing = await run('otool', ['-L', source]);
+    final runPaths = [
+      ...machORunPaths(source, await run('otool', ['-l', source])),
+      ...inheritedRunPaths,
+    ];
     final dependencyLines = const LineSplitter()
         .convert(listing)
         .skip(target.endsWith('.dylib') ? 2 : 1);
@@ -121,15 +145,13 @@ Future<void> main(List<String> args) async {
           dependency.startsWith('/usr/lib/')) {
         continue;
       }
-      if (!p.isAbsolute(dependency)) {
-        throw StateError(
-            'Unresolved non-system dependency: $dependency in $source');
-      }
-      final dependencyReal = await File(dependency).resolveSymbolicLinks();
+      final resolved = await resolveMachODependency(dependency,
+          source: source, runPaths: runPaths);
+      final dependencyReal = await File(resolved).resolveSymbolicLinks();
       if (dependencyReal == source) {
         continue; // dylib install ID, not a dependency
       }
-      edges[dependency] = await copyBinary(dependency);
+      edges[dependency] = await copyBinary(resolved);
     }
     dependencyEdges[target] = edges;
   }
@@ -223,6 +245,31 @@ Future<void> main(List<String> args) async {
       'Packaged ${knowledgeFiles.length} verified knowledge files, ${dataFiles.length} customer-data files, and ${realTargets.length} media binaries; macOS $minimumMacOS+.');
 }
 
+List<String> machORunPaths(String source, String loadCommands) => [
+      for (final match
+          in RegExp(r'cmd LC_RPATH\s+cmdsize \d+\s+path (.+?) \(offset \d+\)')
+              .allMatches(loadCommands))
+        if (match.group(1)!.startsWith('@loader_path/'))
+          p.normalize(p.join(p.dirname(source), match.group(1)!.substring(13)))
+        else if (p.isAbsolute(match.group(1)!))
+          match.group(1)!,
+    ];
+
+Future<String> resolveMachODependency(String dependency,
+    {required String source, required Iterable<String> runPaths}) async {
+  final candidates = [
+    if (p.isAbsolute(dependency)) dependency,
+    if (dependency.startsWith('@loader_path/'))
+      p.normalize(p.join(p.dirname(source), dependency.substring(13))),
+    if (dependency.startsWith('@rpath/'))
+      for (final path in runPaths) p.join(path, dependency.substring(7)),
+  ];
+  for (final path in candidates) {
+    if (await File(path).exists()) return path;
+  }
+  throw StateError('Unresolved non-system dependency: $dependency in $source');
+}
+
 /// Takes a stable build-time snapshot before hashing/package copy. The live
 /// review app may append logs while packaging, so source files are copied once
 /// into a temporary directory. SQLite uses its online backup command rather
@@ -243,6 +290,9 @@ Future<List<Map<String, Object>>> snapshotAndCopyData(
     }
     for (final entry in entries) {
       final relative = p.relative(entry.path, from: source.path);
+      // Downloaded model weights and derived embedding vectors are local
+      // runtime data, not part of the customer-state snapshot/app download.
+      if (p.split(relative).first == 'qwen_embeddings') continue;
       if (p.basename(relative) == '.DS_Store' ||
           relative == 'jd_automation.sqlite3') {
         continue;

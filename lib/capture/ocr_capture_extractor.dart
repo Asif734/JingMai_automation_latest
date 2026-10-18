@@ -6,6 +6,8 @@ import '../domain/capture_models.dart';
 import '../codex/holding_replies.dart';
 import '../platform/macos_capture_adapter.dart';
 import 'ocr_image_candidate_selector.dart';
+import 'jd_message_timestamp.dart';
+import 'ocr_text_sanitizer.dart';
 
 /// Converts one OCR diagnostic scan of an *open* Qianniu conversation into a
 /// conservative capture candidate. All visible incoming and seller-authored
@@ -80,7 +82,8 @@ class OcrCaptureExtractor {
     final customerId = suppliedCustomer != null && suppliedCustomer.isNotEmpty
         ? suppliedCustomer
         : _customerId(observations);
-    final transferNoticeKey = _transferNoticeKey(observations, customerId);
+    final transferNoticeKey =
+        _transferNoticeKey(observations, customerId, inspection.capturedAt);
     final transferNoticeVisible = transferNoticeKey != null;
     if (customerId == null) {
       return const OcrExtractionAttempt(
@@ -105,6 +108,11 @@ class OcrCaptureExtractor {
     final messageLabels = observations
         .where((item) =>
             item.confidence >= senderConfidenceThreshold &&
+            !excludedMediaRegions.any((region) =>
+                item.x + item.width / 2 >= region.x &&
+                item.x + item.width / 2 <= region.x + region.width &&
+                item.y + item.height / 2 >= region.y &&
+                item.y + item.height / 2 <= region.y + region.height) &&
             (_sameIdentity(item.text, customerId) ||
                 _isSellerIdentity(item.text)) &&
             item.x + item.width / 2 >= chatLeft &&
@@ -191,6 +199,15 @@ class OcrCaptureExtractor {
           return byY != 0 ? byY : left.x.compareTo(right.x);
         });
       if (bodies.isEmpty) continue;
+      // Real JD seller bubbles are right-aligned. A left-side video display
+      // under a misread/missing customer label is not an outgoing bubble.
+      // Keep numeric customer messages and long/wrapped seller replies intact.
+      if (hasVerifiedChatRegion &&
+          label.direction == 'outgoing' &&
+          bodies.every(
+              (item) => item.x + item.width < (chatLeft + chatRight) / 2)) {
+        continue;
+      }
       final assembled = _assembleBubbleText(bodies);
       final body = label.direction == 'incoming'
           ? stripAppendedHoldingReply(assembled)
@@ -286,6 +303,7 @@ class OcrCaptureExtractor {
         capturedAt: inspection.capturedAt,
         messages: capturedMessages,
       ),
+      bodyConfidenceThreshold: bodyConfidenceThreshold,
       transferNoticeVisible: transferNoticeVisible,
       transferNoticeKey: transferNoticeKey,
       latestIncomingHasText: latestIncomingHasText,
@@ -327,68 +345,29 @@ class OcrCaptureExtractor {
       // message. Never stop on vertical gaps: OCR may return words or
       // wrapped fragments with unexpectedly separated boxes, and every box
       // inside the sender-bounded region belongs to the same visible turn.
-      final text = line.map((item) => item.text.trim()).join(' ').trim();
+      final text = line
+          .map((item) => item.text.trim())
+          .where((text) => !isJdOcrControlFragment(text))
+          .join(' ')
+          .trim();
       if (text.isNotEmpty) textLines.add(text);
     }
     final combined = textLines.join(' ').replaceAll(RegExp(r'\s+'), ' ').trim();
-    // Apple Vision occasionally emits a standalone uppercase `D` at the end
-    // of a JD bubble, sometimes followed by a misread image/control glyph such
-    // as `回`. Keep model suffixes such as `M880D`: only a whitespace-bounded
-    // standalone D at the end is an artifact.
-    final cleaned = combined
-        // Qianniu renders this fixed composer shortcut below the conversation.
-        // Vision can merge it into the newest bubble when both share one
-        // sender-bounded region. Remove the complete UI hint after OCR while
-        // preserving any customer text that precedes it.
-        .replaceAll(
-            RegExp(
-                r'(?:[◎◉○口回□▣]\s*)?(?:按住\s*)?Shift\s*[+＋]\s*Space\s*可\s*快速\s*选中\s*输入框',
-                caseSensitive: false),
-            '')
-        // JD platform notices are rendered between chat bubbles. Vision can
-        // append them to the newest customer body, but they are not customer
-        // content and must never influence intent or reply generation.
-        .replaceAll(
-            RegExp(r'(?:风险图片\s*)?当前会话您存在消极服务行为.*?(?:异常反馈|$)',
-                caseSensitive: false),
-            '')
-        .replaceAll('你撤回了一条消息', '')
-        .replaceFirstMapped(
-            RegExp(r'(^|[\s，。！？；：,.!?;:])D(?:\s*[◎◉○口回□▣])*\s*$'),
-            (match) => match.group(1)?.trim() ?? '')
-        // `C30` is a recurring JD/Apple Vision control artifact. It is never
-        // customer content in this integration, so remove every occurrence,
-        // including a control glyph Vision may append to it.
-        .replaceAll(RegExp(r'C30(?:\s*[◎◉○口回□▣])?', caseSensitive: false), '')
+    // Sanitize after assembling wrapped lines so a multi-line platform banner
+    // is removed as a unit without leaking its continuation into the request.
+    final cleaned = sanitizeJdOcrText(combined)
         .replaceAll(RegExp(r'\s+'), ' ')
         .replaceAllMapped(RegExp(r'([\u3400-\u9fff])\s+([\u3400-\u9fff])'),
             (match) => '${match.group(1)}${match.group(2)}')
         .trim();
-    // JD image thumbnails and adjacent status controls are sometimes read as
-    // tiny strings such as `◎ 回`, `g 回`, or `•`. These contain no customer
-    // language and must leave the newest turn image-only.
-    if (RegExp(r'^(?:[gG]\s*)?[◎◉○口回□▣•·.\s]+$').hasMatch(cleaned)) {
-      return '';
-    }
-    // A video play overlay is sometimes recognized as a tiny mixture of
-    // Japanese kana, punctuation, and one JD control glyph (for example
-    // `の ¿ 回`). It is not a customer text message. Do not let it close the
-    // unread recovery before the video itself has been captured.
-    final readableCharacters =
-        RegExp(r'[A-Za-z0-9\u3400-\u9fff]').allMatches(cleaned).length;
-    if (readableCharacters <= 1 &&
-        RegExp(r'[◎◉○口回□▣•·¿の]').hasMatch(cleaned) &&
-        RegExp(r'[¿の◎◉○□▣•·]').hasMatch(cleaned)) {
-      return '';
-    }
     return cleaned;
   }
 
   double _verticalCenter(OcrObservation observation) =>
       observation.y + observation.height / 2;
 
-  String? _transferNoticeKey(
-      List<OcrObservation> observations, String? customerId) {
+  String? _transferNoticeKey(List<OcrObservation> observations,
+      String? customerId, DateTime capturedAt) {
     final customerPrefix = customerId?.substring(
         0, customerId.length < 10 ? customerId.length : 10);
     for (final observation in observations) {
@@ -413,8 +392,17 @@ class OcrCaptureExtractor {
           !compact.contains(customerPrefix)) {
         continue;
       }
-      final verticalBucket = (observation.y * 1000).round();
-      final identity = '$customerId\u001f$verticalBucket\u001f$compact';
+      // The same banner moves as messages arrive. Its screen position and
+      // adjacent questions must never create another transfer event.
+      final source =
+          RegExp(r'(?:您的)?同事(.{1,40}?)将客户').firstMatch(compact)?.group(1) ??
+              'summary';
+      final day = capturedAt
+          .toUtc()
+          .add(const Duration(hours: 8))
+          .toIso8601String()
+          .substring(0, 10);
+      final identity = '$customerId\u001ftransfer\u001f$source\u001f$day';
       return sha256.convert(utf8.encode(identity)).toString();
     }
     return null;
@@ -498,7 +486,10 @@ class OcrCaptureExtractor {
     // Current JD builds display the signed-in support identity as names such
     // as "格志打印机小甘", often with the timestamp merged into the same Vision
     // observation. These are seller labels, not customer message bodies.
-    final withoutTimestamp = text.replaceAll(_timestamp, '').trim();
+    final withoutTimestamp = text
+        .replaceAll(_timestamp, '')
+        .replaceAll(RegExp(r'\s*其他客服\s*$'), '')
+        .trim();
     return RegExp(r'^格志打印机[\u3400-\u9fffA-Za-z0-9_-]{1,12}$')
         .hasMatch(withoutTimestamp);
   }
@@ -516,48 +507,10 @@ class OcrCaptureExtractor {
         .join(':');
   }
 
-  DateTime? _parseTimestamp(String? value, DateTime capturedAt) {
-    if (value == null) return null;
-    final numbers = RegExp(r'\d+')
-        .allMatches(value)
-        .map((match) => int.parse(match.group(0)!))
-        .toList(growable: false);
-    if (numbers.length < 2) return null;
-    // JD displays chat clocks in China Standard Time, regardless of the
-    // operator Mac's timezone. A clock-only label must be interpreted against
-    // the JD calendar day, not DateTime.toLocal() on this machine.
-    const jdOffset = Duration(hours: 8);
-    final capturedUtc = capturedAt.toUtc();
-    final jdCapture = capturedUtc.add(jdOffset);
-    late DateTime result;
-    if (numbers.length >= 5 && numbers.first >= 2000) {
-      result = DateTime.utc(
-        numbers[0],
-        numbers[1],
-        numbers[2],
-        numbers[3],
-        numbers[4],
-        numbers.length >= 6 ? numbers[5] : 0,
-      ).subtract(jdOffset);
-    } else {
-      result = DateTime.utc(
-        jdCapture.year,
-        jdCapture.month,
-        jdCapture.day,
-        numbers[0],
-        numbers[1],
-        numbers.length >= 3 ? numbers[2] : 0,
-      ).subtract(jdOffset);
-      // A scan just after midnight can still show a message from yesterday.
-      if (result.difference(capturedUtc) > const Duration(minutes: 1)) {
-        result = result.subtract(const Duration(days: 1));
-      }
-    }
-    return result;
-  }
+  DateTime? _parseTimestamp(String? value, DateTime capturedAt) =>
+      parseJdMessageTimestamp(value, capturedAt);
 
-  static final _timestamp = RegExp(
-      r'(?:20\d{2}[-/.]\d{1,2}[-/.]\d{1,2}\s+)?\d{1,2}:\d{2}(?::\d{2})?');
+  static final _timestamp = jdMessageTimestampPattern;
   static final _sidebarRecency = RegExp(
       r'^\d+\s*(?:秒|分钟|分|小时|天|second|seconds|min|mins)$',
       caseSensitive: false);
@@ -589,6 +542,7 @@ class OcrExtractionAttempt {
     this.latestVisibleSenderIsIncoming = false,
     this.latestIncomingSenderKey,
     this.latestIncomingSentAt,
+    this.bodyConfidenceThreshold = .45,
   });
 
   final String reason;
@@ -603,6 +557,15 @@ class OcrExtractionAttempt {
   /// Stable across scans even when a media-only bubble has no OCR body.
   final String? latestIncomingSenderKey;
   final DateTime? latestIncomingSentAt;
+  final double bodyConfidenceThreshold;
+
+  /// Reuse the already approved recovery threshold after excluding media.
+  /// Masking must not silently revert a two-scan-approved .30 body to .45.
+  CapturedConversation? textExcludingMedia(
+          OcrInspection inspection, List<OcrVisualRegion> regions) =>
+      OcrCaptureExtractor(bodyConfidenceThreshold: bodyConfidenceThreshold)
+          .analyze(inspection, excludedMediaRegions: regions)
+          .capture;
 }
 
 class OcrCopyTarget {
