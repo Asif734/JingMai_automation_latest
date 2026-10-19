@@ -19,8 +19,21 @@ const retrievalTopicPatterns = <String, String>{
       r'\b(?:remove|release|take out|pull out)\b[^\n.!?]{0,35}\bpaper\b|取(?:出|下)纸|取出.{0,8}(?:卡|皱).*纸|清除卡纸|排纸|不反向猛拉',
 };
 
+/// A buying question is not a continuation of an older technical problem.
+/// "Get a driver/manual" and mixed repair/safety requests are not shopping.
+bool isPurchaseLocationQuery(String text) =>
+    RegExp(
+      r'\bwhere\s+(?:(?:can|could|do|should)\s+(?:i|we)\s+|to\s+)(?:buy|purchase|order|get|find)\b|\bhow\s+(?:can|do|could)\s+(?:i|we)\s+(?:buy|purchase|order)\b|(?:哪里|在哪|哪儿|何处).{0,12}(?:买|购买|订购|有卖)|(?:怎么|如何)(?:买|购买|下单)|(?:买|购买).{0,12}(?:哪里|哪儿)',
+      caseSensitive: false,
+    ).hasMatch(text) &&
+    !RegExp(
+      r'\b(?:drivers?|manuals?|instructions?|downloads?|apps?|software|repair(?:ed|ing|s)?|fix(?:ed|ing)?|refund|return|smoke|smoking|burning|fire|sparks?|not working|stuck|jammed)\b|驱动|说明书|教程|下载|软件|维修|故障|卡纸|退款|退货|冒烟|着火|漏电',
+      caseSensitive: false,
+    ).hasMatch(text);
+
 Set<String> retrievalTopics(String text) {
   final found = {
+    if (isPurchaseLocationQuery(text)) 'product_availability',
     for (final entry in retrievalTopicPatterns.entries)
       if (RegExp(entry.value, caseSensitive: false).hasMatch(text)) entry.key,
   };
@@ -55,6 +68,17 @@ List<Map<String, dynamic>> focusRetrievalTurns(
   for (final previous in meaningful.reversed.skip(1)) {
     final latest = selected.first['body']?.toString() ?? '';
     final earlierTopics = retrievalTopics(previous['body']?.toString() ?? '');
+    if (isPurchaseLocationQuery(latest) &&
+        !earlierTopics.contains('product_availability') &&
+        earlierTopics.any(const {
+          'paper_feed',
+          'paper_removal',
+          'print_quality',
+          'shift_setup',
+          'date_setup'
+        }.contains)) {
+      break;
+    }
     final reference = RegExp(
                 r'^(?:and\b|also\b|then\b|what (?:should|do) i do\b|what about\b|how about\b|yes\b|both\b|again\b|还是|然后|还有|那|就是|对|是的)|\b(?:this|that|it|them)\b',
                 caseSensitive: false)

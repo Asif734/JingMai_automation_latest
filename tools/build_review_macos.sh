@@ -11,7 +11,7 @@ review_app="$review_root/Build/Products/Release/JD Automation Review.app"
 flutter build macos --release --config-only --no-pub \
   --dart-define=JD_STANDALONE=false \
   --dart-define="JD_APP_NAME=JD Automation Review" \
-  --build-name=0.1.5 --build-number=12
+  --build-name=0.1.5 --build-number=14
 xcodebuild -quiet -workspace macos/Runner.xcworkspace -scheme Runner \
   -configuration Release -destination 'platform=macOS,arch=arm64' \
   -derivedDataPath "$review_root" -disableAutomaticPackageResolution \

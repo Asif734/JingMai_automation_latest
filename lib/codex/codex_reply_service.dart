@@ -57,9 +57,12 @@ Set<String> codexHumanTransferRequestIds(AiDraft draft) {
   return ids.whereType<String>().where((id) => id.isNotEmpty).toSet();
 }
 
-/// Only an approved transfer flow may move a JD conversation. This includes
-/// the completed two-request colleague flow, the refund exception, and a
-/// completed second database inspection with no supported technical solution.
+/// Temporary policy pause requested by the operator. Retrieval still gets its
+/// second inspection; missing technical knowledge must not move the customer.
+const automaticTechnicalTransfersEnabled = false;
+
+/// Only an approved flow may move a conversation. Explicit colleague requests,
+/// refund handling and verified active-safety handoffs retain their rules.
 bool isExplicitHumanTransfer(AiDraft draft) {
   if (!draftRequiresHumanReview(draft)) return false;
   try {
@@ -67,12 +70,12 @@ bool isExplicitHumanTransfer(AiDraft draft) {
     final triggers = (raw['risk_triggers'] as List<Object?>? ?? const [])
         .map((value) => value.toString());
     final trace = raw['retrieval_trace'];
-    final completedKnowledgeTransfer =
+    final completedKnowledgeTransfer = automaticTechnicalTransfersEnabled &&
         triggers.contains(exhaustedKnowledgeTransferTrigger) &&
-            trace is Map &&
-            trace['knowledge_exhaustion_transfer_allowed'] == true &&
-            trace['second_inspection_completed'] == true &&
-            trace['no_supported_answer_after_second_inspection'] == true;
+        trace is Map &&
+        trace['knowledge_exhaustion_transfer_allowed'] == true &&
+        trace['second_inspection_completed'] == true &&
+        trace['no_supported_answer_after_second_inspection'] == true;
     return triggers.contains('explicit_human_request') ||
         triggers.contains('refund_transfer_required') ||
         isApprovedSafetyHandoff(draft) ||
@@ -339,7 +342,7 @@ bool hasTechnicalSupportIntent(String text) =>
         .any((topic) => topic.startsWith('paper_') || topic == 'safety');
 
 bool isTechnicalSupportTurn(String currentTurnText, String recentContext) =>
-    !isProductAvailabilityQuestion(currentTurnText) &&
+    !isGeneralProductInquiry(currentTurnText) &&
     (hasTechnicalSupportIntent(currentTurnText) ||
         (RegExp(r'\b(it|this|that|your product|product link|why|then|still|again)\b|这个|那个|你们的产品|产品链接|为什么|然后|仍然|还是',
                     caseSensitive: false)
@@ -347,18 +350,26 @@ bool isTechnicalSupportTurn(String currentTurnText, String recentContext) =>
             hasTechnicalSupportIntent(recentContext)));
 
 bool isProductAvailabilityQuestion(String text) =>
+    isPurchaseLocationQuery(text) ||
     !RegExp(r'怎么|如何|不能|无法|连不上|失败|故障|模糊|不清晰|\bhow\b|not work|cannot|can\x27t',
-            caseSensitive: false)
-        .hasMatch(text) &&
-    (hasProductSalesIntent(text) ||
-        retrievalTopics(text).contains('print_speed') ||
-        ((hasProductFeatureIntent(text) || hasCopyCapacityIntent(text)) &&
-            RegExp(r'可以|支持|有没有|能不能|需要|想要|\bcan\b|\bdoes\b|\bsupport|\bneed\b|\bwant\b',
-                    caseSensitive: false)
-                .hasMatch(text)));
+                caseSensitive: false)
+            .hasMatch(text) &&
+        (hasProductSalesIntent(text) ||
+            retrievalTopics(text).contains('print_speed') ||
+            ((hasProductFeatureIntent(text) || hasCopyCapacityIntent(text)) &&
+                RegExp(r'可以|支持|有没有|能不能|需要|想要|\bcan\b|\bdoes\b|\bsupport|\bneed\b|\bwant\b',
+                        caseSensitive: false)
+                    .hasMatch(text)));
 
 bool hasProductSalesIntent(String text) =>
     retrievalTopics(text).contains('product_availability');
+
+bool isGeneralProductInquiry(String text) =>
+    isProductAvailabilityQuestion(text) ||
+    (!hasTechnicalSupportIntent(text) &&
+        RegExp(r'\bhow (?:fast|much)\b|\bwhat (?:type|kind|model|features?|versions?|price)\b|\bwhich (?:model|version)\b|多少钱|什么(?:型号|类型|功能|版本)|哪种(?:型号|版本)|价格|快不快',
+                caseSensitive: false)
+            .hasMatch(text));
 
 /// Missing basic information is not transfer authority. Keep technical,
 /// safety, refund and account/order operations on their existing policies.
@@ -1856,13 +1867,16 @@ class CodexReplyService {
         .map((message) => message['body']?.toString() ?? '')
         .where((body) => body.isNotEmpty)
         .join('\n');
-    final technicalFollowUp =
-        isTechnicalSupportTurn(currentTurnText, recentCustomerContext) ||
+    final generalProductInquiry = isGeneralProductInquiry(latestCustomerText) &&
+        !isExplicitColleagueRequest(currentTypedText) &&
+        !refundFlowActive;
+    final technicalFollowUp = !generalProductInquiry &&
+        (isTechnicalSupportTurn(currentTurnText, recentCustomerContext) ||
             (!asksForMediaDescription(currentTypedText) &&
                 videoReports.any((r) =>
                     r.observedProblem.isNotEmpty &&
                     isTechnicalSupportTurn(
-                        r.observedProblem, recentCustomerContext)));
+                        r.observedProblem, recentCustomerContext))));
     var retrievalCustomerTurns = [
       ...latestRelevantCustomerTurns(topicMessages,
           limit: technicalFollowUp ? 5 : 3)
@@ -2292,7 +2306,8 @@ class CodexReplyService {
       'product_feature_requested': productFeatureRequested,
       'technical_support_requested': technicalSupportRequested,
       'basic_informational_question': basicInformationalQuestion,
-      'knowledge_exhaustion_transfer_allowed': technicalSupportRequested,
+      'knowledge_exhaustion_transfer_allowed':
+          technicalSupportRequested && automaticTechnicalTransfersEnabled,
       'product_list_requested': productListRequested,
       'video_guide_requested': videoGuideRequested,
       'package_contents_requested': packageContentsRequested,
@@ -2325,7 +2340,7 @@ class CodexReplyService {
             ? 'Attempt 2: reconsider the unresolved request using fresh records and catalog rows; the failed draft is not evidence.'
             : 'Attempt 1: if knowledge genuinely lacks the answer, report the precise gap for a fresh second inspection. A missing customer detail may receive a clarification directly.',
         technicalSupportRequested
-            ? 'Technical support: give supported safe steps, without repeating failed steps. Only an unresolved solution after attempt 2 permits knowledge-exhaustion transfer.'
+            ? 'Technical support: give supported safe steps without repeating failed steps. Automatic technical transfers are paused: after attempt 2, stay in this chat and ask one useful, unasked clarification if no solution is supported. Never promise a colleague or a transfer.'
             : 'General/sales: if no answer is found, ask one useful clarification. Do not transfer or promise later colleague verification.',
         if (activeModels.isNotEmpty)
           'Active model: ${activeModels.join(', ')}; source: ${modelResolution.source}. Verify all facts against supplied evidence.',
@@ -2588,12 +2603,16 @@ ${jsonEncode(request)}
                       verifiedModelFacts: verifiedModelFacts,
                       approvedRecordIds: approvedRecordIds)
                   : noAnswerAfterSecondInspection
-                      ? _forceHumanReview(draft, latestCustomerText,
-                          chineseReply: safeTransferAcknowledgement(),
-                          trigger: exhaustedKnowledgeTransferTrigger,
-                          reason:
-                              'No supported answer after two database inspections with fresh constrained queries. '
-                              'Unresolved: ${inspectionSignals.join(', ')}')
+                      ? !automaticTechnicalTransfersEnabled
+                          ? enforceTechnicalTransferPause(draft,
+                              customerText: currentTypedText,
+                              technicalContext: recentCustomerContext)
+                          : _forceHumanReview(draft, latestCustomerText,
+                              chineseReply: safeTransferAcknowledgement(),
+                              trigger: exhaustedKnowledgeTransferTrigger,
+                              reason:
+                                  'No supported answer after two database inspections with fresh constrained queries. '
+                                  'Unresolved: ${inspectionSignals.join(', ')}')
                       : enforceHumanReviewPolicy(
                           draft,
                           latestCustomerText,
@@ -2619,8 +2638,16 @@ ${jsonEncode(request)}
               productPhotoRequested
           ? enforceProductPhotoReview(reviewGuardedDraft, latestCustomerText)
           : reviewGuardedDraft;
-      final guardedDraft =
-          enforceCustomerFacingPolicy(photoGuardedDraft, latestCustomerText);
+      final guardedDraft = enforceCustomerFacingPolicy(
+          technicalSupportRequested &&
+                  !refundFlowActive &&
+                  !latestTransferRequested &&
+                  !hasAppliedSafetyPolicy(photoGuardedDraft)
+              ? enforceTechnicalTransferPause(photoGuardedDraft,
+                  customerText: currentTypedText,
+                  technicalContext: recentCustomerContext)
+              : photoGuardedDraft,
+          latestCustomerText);
       final tracedDraft = _withRetrievalTrace(
         guardedDraft,
         focusedQuery: focusedQuery,
@@ -2633,7 +2660,8 @@ ${jsonEncode(request)}
         secondInspectionCompleted: secondInspectionCompleted,
         noAnswerAfterSecondInspection: noAnswerAfterSecondInspection,
         basicInformationalQuestion: basicInformationalQuestion,
-        knowledgeExhaustionTransferAllowed: technicalSupportRequested,
+        knowledgeExhaustionTransferAllowed:
+            technicalSupportRequested && automaticTechnicalTransfersEnabled,
         firstInspection: precedingInspection,
         failureSignals: inspectionSignals,
       );
@@ -2904,7 +2932,43 @@ ${jsonEncode({
               RegExp(r'\bhuman review\b', caseSensitive: false),
               'customer service follow-up',
             );
-    raw['reply'] = normalizeCustomerFacingUrls(policyReply);
+    if (_requestsProductPage(policyReply) ||
+        (raw['required_slots'] as List? ?? const []).any((slot) =>
+            RegExp(r'product_(?:listing|page|link)|listing_url')
+                .hasMatch(slot.toString()))) {
+      final clarification = _generalProductClarification(latestCustomerText);
+      final retained = RegExp(r'[^.!?。！？]+[.!?。！？]?')
+          .allMatches(policyReply)
+          .map((m) => m.group(0)!.trim())
+          .where((s) => s.isNotEmpty && !_requestsProductPage(s))
+          .join(' ');
+      raw['reply'] = normalizeCustomerFacingUrls(RegExp(r'[?？]')
+              .hasMatch(retained)
+          ? retained
+          : '${retained.isEmpty ? '' : '$retained '}${clarification.reply}');
+      raw['required_slots'] = [
+        ...(raw['required_slots'] as List? ?? const []).where((slot) =>
+            !RegExp(r'product_(?:listing|page|link)|listing_url')
+                .hasMatch(slot.toString())),
+        clarification.slot,
+      ];
+      if (!draftRequiresHumanReview(draft)) {
+        raw['decision'] = 'ask_clarification';
+      }
+    } else {
+      raw['reply'] = normalizeCustomerFacingUrls(policyReply);
+    }
+    if (isPurchaseLocationQuery(latestCustomerText) &&
+        !isExplicitColleagueRequest(latestCustomerText) &&
+        !isRefundRequest(latestCustomerText) &&
+        !RegExp(r'our JD store|our store on JD|我们(?:的)?京东店铺|本店京东|本店',
+                caseSensitive: false)
+            .hasMatch(raw['reply'].toString())) {
+      final store = _customerPrefersEnglish(latestCustomerText)
+          ? 'Please check our JD store for purchase options.'
+          : '您可以在我们京东店铺查看选购。';
+      raw['reply'] = '$store\n${raw['reply']}';
+    }
     raw['model'] = draft.model;
     return AiDraft.fromJson(raw.cast<String, Object?>(),
         mediaBaseUrl: Uri.parse('http://127.0.0.1'));
@@ -3037,6 +3101,57 @@ ${jsonEncode({
         mediaBaseUrl: Uri.parse('http://127.0.0.1'));
   }
 
+  AiDraft enforceTechnicalTransferPause(AiDraft draft,
+      {required String customerText, required String technicalContext}) {
+    if (automaticTechnicalTransfersEnabled ||
+        isExplicitHumanTransfer(draft) ||
+        hasAppliedSafetyPolicy(draft)) {
+      return draft;
+    }
+    final deferral = RegExp(
+            r'\b(?:transfer|colleague|further review|human agent)\b|转接|客服同事|技术同事',
+            caseSensitive: false)
+        .hasMatch(draft.reply);
+    if (!draftRequiresHumanReview(draft) &&
+        !modelStatesNoSolution(draft) &&
+        !deferral) {
+      return draft;
+    }
+    final english = _customerPrefersEnglish(customerText);
+    final phone = RegExp(r'\b(?:phone|iphone|android|mobile)\b|手机|安卓|苹果手机',
+            caseSensitive: false)
+        .hasMatch(technicalContext);
+    final platformKnown =
+        RegExp(r'\b(?:iphone|ios|android)\b|安卓|苹果手机', caseSensitive: false)
+            .hasMatch(technicalContext);
+    final raw = jsonDecode(draft.rawJson) as Map<String, dynamic>;
+    raw
+      ..['reply'] = phone
+          ? platformKnown
+              ? (english
+                  ? 'At which connection step does it stop, and what does your phone show?'
+                  : '请问连接到哪一步无法继续，手机上显示什么提示呢？')
+              : (english
+                  ? 'Are you using an Android phone or an iPhone?'
+                  : '请问您使用的是安卓手机还是苹果手机呢？')
+          : (english
+              ? 'What happens at the step you are trying now, and is any error shown?'
+              : '请问现在操作到哪一步出现异常，是否有报错或指示灯提示呢？')
+      ..['decision'] = 'ask_clarification'
+      ..['required_slots'] = [
+        phone && !platformKnown ? 'phone_platform' : 'current_step_and_symptom'
+      ]
+      ..['used_record_ids'] = <String>[]
+      ..['human_review_required'] = false
+      ..['risk_level'] = 'low'
+      ..['risk_triggers'] = <String>[]
+      ..['actions'] = <Object?>[]
+      ..['attachments'] = <Object?>[]
+      ..['reason'] =
+          'Automatic technical transfers are paused; continue clarification in this conversation.';
+    return AiDraft.fromJson(raw.cast<String, Object?>(), mediaBaseUrl: Uri());
+  }
+
   /// A final safety net after two successful inspections, not a substitute
   /// for retrieval. Missing low-risk information must not move the customer.
   /// Never convert catalog membership into a real-time stock promise.
@@ -3058,6 +3173,7 @@ ${jsonEncode({
     var reply = draft.reply;
     var ids = draft.usedRecordIds;
     var slots = <String>[];
+    final clarification = _generalProductClarification(customerText);
     if (hasProductSalesIntent(customerText) &&
         lifecycleRows.length == 1 &&
         approvedRecordIds.contains('product_model_feature_catalog')) {
@@ -3071,13 +3187,13 @@ ${jsonEncode({
             ? '$model is marked as discontinued in our catalog and is not a current sales recommendation. Would you like help choosing a current model?'
             : '$model 在产品目录中已标为停产，不作为当前在售推荐。需要我帮您看看现款型号吗？',
         _ => english
-            ? '$model is listed in our current product catalog; that does not confirm live stock. Could you share the product listing you are looking at?'
-            : '$model 在当前产品目录中，但目录状态不代表实时库存。方便发一下您正在看的商品页面吗？',
+            ? '$model is listed in our current product catalog; that does not confirm live stock. Please check our JD store. Which version or specification do you need?'
+            : '$model 在当前产品目录中，但目录状态不代表实时库存。您可以在我们京东店铺查看，您需要哪种版本或规格呢？',
       };
       ids = ['product_model_feature_catalog'];
       slots = [
         row['catalog_status'] == 'current'
-            ? 'product_listing'
+            ? 'product_specification'
             : 'current_model_preference'
       ];
     } else {
@@ -3092,21 +3208,18 @@ ${jsonEncode({
                 'internal_capture_text',
                 'requesting_store_manual_instead_of_answer'
               }.contains(signal));
-      if (canRetainAnswer) {
+      if (canRetainAnswer && !_requestsProductPage(reply)) {
         slots = (raw['required_slots'] as List? ?? const [])
             .map((slot) => slot.toString())
             .toList();
         if (!RegExp(r'[?？]').hasMatch(reply)) {
-          reply =
-              '$reply ${english ? 'Could you share the product page so I can check that detail?' : '方便发一下商品页面吗？我帮您核对这一项。'}';
-          slots = ['product_listing'];
+          reply = '$reply ${clarification.reply}';
+          slots = [clarification.slot];
         }
       } else {
-        reply = english
-            ? 'Could you share the product page so I can check that detail against the exact listing?'
-            : '方便发一下商品页面吗？我帮您按具体商品信息核对这一项。';
+        reply = clarification.reply;
         ids = [];
-        slots = ['product_listing'];
+        slots = [clarification.slot];
       }
     }
     raw
@@ -3121,6 +3234,51 @@ ${jsonEncode({
       ..['actions'] = <Object?>[]
       ..['attachments'] = <Object?>[];
     return AiDraft.fromJson(raw.cast<String, Object?>(), mediaBaseUrl: Uri());
+  }
+
+  bool _requestsProductPage(String text) {
+    final request = RegExp(
+      r'^(?:(?:(?:could|can|would|will)\s+you|please|kindly)\b[^.!?\n]{0,50})?(?:share|send|provide|give|show|upload|attach|paste)\b|^i\s+(?:need|require)\b|^(?:which|what)\s+(?:product page|product listing|item page|link|url)\b|^(?:(?:麻烦|方便|请|能否|可以|能不能|可否|能)(?:您|你)?[^。！？\n]{0,25})?(?:发|提供|分享|给我|告诉我)',
+      caseSensitive: false,
+    );
+    final page = RegExp(
+        r'\b(?:product page|product listing|item page|links?|urls?)\b|商品页面|商品页|商品详情页|链接',
+        caseSensitive: false);
+    // Only requests to the customer are blocked. An approved tutorial link
+    // offered by us, or an instruction to open it, must remain usable.
+    return text
+        .split(RegExp(r'[.!?。！？\n]'))
+        .any((part) => request.hasMatch(part.trim()) && page.hasMatch(part));
+  }
+
+  ({String reply, String slot}) _generalProductClarification(String text) {
+    final english = _customerPrefersEnglish(text);
+    final modelKnown = explicitProductModels(text).isNotEmpty;
+    if (hasProductSalesIntent(text)) {
+      return (
+        reply: english
+            ? 'Please check our JD store for purchase options. ${modelKnown ? 'Which version or specification do you need?' : 'Which printer model or accessory are you looking for?'}'
+            : '您可以在我们京东店铺查看选购。${modelKnown ? '您需要哪种版本或规格呢？' : '请问您想找哪款机器或哪种配件呢？'}',
+        slot:
+            modelKnown ? 'product_specification' : 'product_model_or_accessory',
+      );
+    }
+    if (RegExp(r'warranty|保修|质保', caseSensitive: false).hasMatch(text)) {
+      return (
+        reply: english
+            ? 'Which product model and purchase date is this about?'
+            : '请问是哪款产品、大约什么时候购买的呢？',
+        slot: 'model_and_purchase_date'
+      );
+    }
+    return (
+      reply: english
+          ? (modelKnown
+              ? 'Which specific feature or requirement would you like me to check?'
+              : 'Which product model is this about?')
+          : (modelKnown ? '请问您具体想了解哪项功能或使用要求呢？' : '请问您咨询的是哪款产品型号呢？'),
+      slot: modelKnown ? 'product_requirement' : 'product_model'
+    );
   }
 
   AiDraft _refundProblemClarificationDraft(String customerText,

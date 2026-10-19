@@ -4,6 +4,7 @@ import 'dart:io';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:jd_automation/codex/codex_reply_service.dart';
 import 'package:jd_automation/codex/knowledge_inspection.dart';
+import 'package:jd_automation/codex/customer_video_report.dart';
 import 'package:jd_automation/domain/capture_models.dart';
 import 'package:jd_automation/storage/capture_database.dart';
 import 'package:jd_automation/codex/semantic_scoring.dart';
@@ -52,6 +53,7 @@ class _InspectionFixture {
       SemanticKnowledgeScorer? secondScorer,
       List<Map<String, Object?>> extraRecords = const [],
       List<CapturedMessage> contextMessages = const [],
+      bool questionWithVideo = false,
       String? catalog,
       bool failSecond = false,
       bool failPlanner = false}) async {
@@ -84,6 +86,17 @@ class _InspectionFixture {
     await File('${knowledge.path}/product_model_feature_catalog_kb.md')
         .writeAsString(catalog ??
             '# Product catalog\n| Model | Category | Confirmed facts |\n| QZ123 | thermal printer | 标准版120mm/s，高速版180mm/s |\n');
+    final questionMedia = questionWithVideo
+        ? [
+            CapturedMedia(
+                type: 'image',
+                path: await (await database.history).saveMedia(
+                    userId: 'buyer-a',
+                    filename: 'video-frame.jpg',
+                    bytes: [1, 2, 3]),
+                captureSource: 'jd_video_frame_1fps')
+          ]
+        : <CapturedMedia>[];
     await database.saveCapture(CapturedConversation(
         stableKey: 'customer:buyer-a',
         customerName: 'buyer-a',
@@ -91,6 +104,13 @@ class _InspectionFixture {
         capturedAt: DateTime.now(),
         messages: [
           ...contextMessages,
+          if (questionWithVideo)
+            CapturedMessage(
+                stableId: 'video-a',
+                direction: 'incoming',
+                body: '[Customer sent a video]',
+                media: questionMedia,
+                axPath: 'test'),
           CapturedMessage(
               stableId: 'question-a',
               direction: 'incoming',
@@ -325,10 +345,68 @@ void main() {
     expect(
         raw['retrieval_trace']['basic_information_no_auto_transfer'], isTrue);
     expect(raw['retrieval_trace']['first_inspection'], isNotNull);
-    expect(result.reply, contains('product page'));
+    expect(result.reply, contains('product model and purchase date'));
     expect(result.reply, isNot(contains('sticker')));
     expect(await fixture.database.hasUndeliveredDraft('buyer-a'), isFalse);
   });
+
+  for (final withVideoReport in [false, true]) {
+    test('where-can-I-get-this stays in-store, video report: $withVideoReport',
+        () async {
+      final fixture = _InspectionFixture();
+      await fixture.create(
+          question: 'where can i get this?',
+          questionWithVideo: withVideoReport,
+          contextMessages: const [
+            CapturedMessage(
+                stableId: 'old-fault',
+                direction: 'incoming',
+                body: 'paper stuck halfway, printer not working',
+                axPath: 'test')
+          ],
+          first: _draft('I cannot confirm availability. Please transfer.',
+              decision: 'human_review_required'),
+          second: _draft('I cannot find an answer. A colleague needs to check.',
+              decision: 'human_review_required'));
+      addTearDown(fixture.close);
+      if (withVideoReport) {
+        final store = await fixture.database.history;
+        final document = (await store.read('buyer-a'))!;
+        final event = CustomerVideoEvent(
+            'buyer-a',
+            (document['messages'] as List)
+                .whereType<Map<String, dynamic>>()
+                .singleWhere((m) => m['id'] == 'video-a'));
+        final frame = event.frames.single;
+        expect(
+            await store.saveCustomerVideoReport(
+                'buyer-a',
+                CustomerVideoReport(
+                    event,
+                    'A printer feeds paper partway.',
+                    'Paper stuck, printer not working.',
+                    ['paper feed stops halfway'],
+                    ['Cause unknown.'],
+                    {frame: 'Paper protrudes from the printer.'})),
+            isTrue);
+      }
+      final result = await fixture.generate();
+      expect(await fixture.calls(), '2');
+      for (final n in [1, 2]) {
+        final request = await fixture.request(n);
+        expect(request['technical_support_requested'], isFalse);
+        expect(request['knowledge_exhaustion_transfer_allowed'], isFalse);
+        if (withVideoReport) {
+          expect(request['customer_video_reports'], hasLength(1));
+        }
+      }
+      expect(result.decision, 'ask_clarification');
+      expect(result.reply, contains('our JD store'));
+      expect(result.reply, isNot(contains('product page')));
+      expect(isExplicitHumanTransfer(result), isFalse);
+      expect(draftRequiresHumanReview(result), isFalse);
+    });
+  }
 
   test('TP879 legacy sales question cannot transfer after two model refusals',
       () async {
@@ -376,7 +454,7 @@ void main() {
     expect(await fixture.calls(), '1');
   });
 
-  test('technical no-answer still transfers after the completed second search',
+  test('technical no-answer stays in chat after the completed second search',
       () async {
     final fixture = _InspectionFixture();
     await fixture.create(
@@ -389,9 +467,84 @@ void main() {
     final result = await fixture.generate();
     expect(await fixture.calls(), '2');
     expect((await fixture.request(1))['basic_informational_question'], isFalse);
-    expect(isExplicitHumanTransfer(result), isTrue);
+    expect(isExplicitHumanTransfer(result), isFalse);
+    expect(draftRequiresHumanReview(result), isFalse);
+    expect(result.decision, 'ask_clarification');
+    expect((await fixture.request(1))['knowledge_exhaustion_transfer_allowed'],
+        isFalse);
+    expect(
+        (jsonDecode(result.rawJson) as Map)['retrieval_trace']
+            ['second_inspection_completed'],
+        isTrue);
     expect((jsonDecode(result.rawJson) as Map)['risk_triggers'],
-        contains(exhaustedKnowledgeTransferTrigger));
+        isNot(contains(exhaustedKnowledgeTransferTrigger)));
+  });
+
+  test('TP874 phone setup asks the platform instead of transferring', () async {
+    final fixture = _InspectionFixture();
+    await fixture.create(
+        question: 'it is tp874',
+        contextMessages: const [
+          CapturedMessage(
+              stableId: 'phone-question',
+              direction: 'incoming',
+              body: 'how to connect to the phone, do you have a tutorial?',
+              axPath: 'test'),
+        ],
+        first: _draft(
+            'No verified connection instructions. A colleague needs to check.',
+            decision: 'human_review_required'),
+        second: _draft('No supported solution. Please transfer.',
+            decision: 'human_review_required'));
+    addTearDown(fixture.close);
+    final result = await fixture.generate();
+    expect(await fixture.calls(), '2');
+    expect(result.decision, 'ask_clarification');
+    expect(result.reply, contains('Android phone or an iPhone'));
+    expect(result.reply, isNot(contains('JD store')));
+    expect(result.reply, isNot(contains('model number')));
+    expect(draftRequiresHumanReview(result), isFalse);
+    expect(isExplicitHumanTransfer(result), isFalse);
+  });
+
+  test('technical pause blocks old exhaustion receipts, not explicit flows',
+      () {
+    final service = CodexReplyService(
+        executable: '/unused',
+        workspace: Directory('/unused'),
+        knowledgeDirectory: Directory('/unused'),
+        outputSchema: File('/unused'));
+    final legacy = AiDraft.fromJson({
+      ..._draft('I will transfer you to a colleague.',
+          decision: 'human_review_required'),
+      'risk_triggers': [exhaustedKnowledgeTransferTrigger],
+      'retrieval_trace': {
+        'knowledge_exhaustion_transfer_allowed': true,
+        'second_inspection_completed': true,
+        'no_supported_answer_after_second_inspection': true
+      },
+    }, mediaBaseUrl: Uri());
+    expect(isExplicitHumanTransfer(legacy), isFalse);
+    final clarified = service.enforceTechnicalTransferPause(legacy,
+        customerText: 'TP874', technicalContext: 'connect an Android phone');
+    expect(clarified.reply, contains('connection step'));
+    expect(clarified.reply, isNot(contains('Android phone or an iPhone')));
+    expect(draftRequiresHumanReview(clarified), isFalse);
+    for (final trigger in [
+      'explicit_human_request',
+      'refund_transfer_required'
+    ]) {
+      final allowed = AiDraft.fromJson({
+        ..._draft('I will transfer you to a colleague.',
+            decision: 'human_review_required'),
+        'risk_triggers': [trigger],
+      }, mediaBaseUrl: Uri());
+      expect(isExplicitHumanTransfer(allowed), isTrue);
+      expect(
+          service.enforceTechnicalTransferPause(allowed,
+              customerText: 'TP874', technicalContext: 'connect a phone'),
+          same(allowed));
+    }
   });
 
   test('500-employee attendance recommendation is not a technical failure',

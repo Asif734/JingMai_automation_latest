@@ -10,7 +10,7 @@ standalone_app="$standalone_root/Build/Products/Release/JD Automation Standalone
 flutter build macos --release --config-only --no-pub \
   --dart-define=JD_STANDALONE=true \
   --dart-define="JD_APP_NAME=JD Automation Standalone" \
-  --build-name=0.1.5 --build-number=6
+  --build-name=0.1.5 --build-number=14
 xcodebuild -quiet -workspace macos/Runner.xcworkspace -scheme Runner \
   -configuration Release -destination 'platform=macOS,arch=arm64' \
   -derivedDataPath "$standalone_root" -disableAutomaticPackageResolution \

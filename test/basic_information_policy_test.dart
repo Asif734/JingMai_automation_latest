@@ -22,7 +22,12 @@ void main() {
       'Do you carry TP874?',
       'Is TP879 in stock?',
       '有TP879吗',
-      'TP874有货吗'
+      'TP874有货吗',
+      'where can i get this?',
+      'Where can I buy this ribbon?',
+      'How can I buy this?',
+      '这个在哪里买？',
+      '纸卷哪里买？',
     ]) {
       expect(hasProductSalesIntent(text), isTrue, reason: text);
       expect(hasProductFeatureIntent(text), isTrue, reason: text);
@@ -44,6 +49,25 @@ void main() {
             'for my 500 emoloyee which one would be the best',
             'what type of attendance machine you sale?'),
         isTrue);
+    for (final text in [
+      'Where can I get the driver?',
+      'Where can I get this repaired?',
+      'Where can I buy this? It is burning now.'
+    ]) {
+      expect(isPurchaseLocationQuery(text), isFalse, reason: text);
+    }
+    for (final text in [
+      'how fast does it print?',
+      'what type of printer is this?',
+      'how much does it cost?',
+      '这个多少钱？'
+    ]) {
+      expect(isGeneralProductInquiry(text), isTrue, reason: text);
+      expect(isTechnicalSupportTurn(text, 'paper stuck, printer not working'),
+          isFalse,
+          reason: text);
+    }
+    expect(isGeneralProductInquiry('how do I connect this printer?'), isFalse);
   });
 
   test('actual catalog supplies exact TP879 legacy membership, not stock',
@@ -102,11 +126,79 @@ void main() {
       expect(result.reply, contains('?'));
       if (status == 'unknown') {
         expect(result.usedRecordIds, isEmpty);
-        expect(result.reply, contains('product page'));
+        expect(result.reply, contains('our JD store'));
       } else {
         expect(result.usedRecordIds, ['product_model_feature_catalog']);
       }
       expect((jsonDecode(result.rawJson) as Map)['risk_triggers'], isEmpty);
+    }
+  });
+
+  test('all reply paths reject requests for customer product pages or links',
+      () {
+    final service = CodexReplyService(
+        executable: '/unused',
+        workspace: Directory('/unused'),
+        knowledgeDirectory: Directory('/unused'),
+        outputSchema: File('/unused'));
+    for (final item in [
+      (
+        'where can i get this?',
+        'Could you share the product page so I can check the exact listing?'
+      ),
+      ('Where can I buy this?', 'Please send me a link to this item.'),
+      ('这个在哪里买？', '方便发一下商品页面吗？'),
+      ('这个在哪里买？', '可以把链接发我吗？'),
+    ]) {
+      final draft = AiDraft.fromJson({
+        'reply': item.$2,
+        'decision': 'ask_clarification',
+        'confidence': .9,
+        'used_record_ids': [],
+        'required_slots': ['product_listing'],
+        'actions': [],
+        'risk_level': 'low',
+        'risk_triggers': [],
+        'human_review_required': false,
+      }, mediaBaseUrl: Uri());
+      final result = service.enforceCustomerFacingPolicy(draft, item.$1);
+      expect(result.reply, isNot(contains(item.$2)));
+      expect(result.reply, matches(r'our JD store|我们京东店铺'));
+      expect(result.reply, contains(RegExp(r'[?？]')));
+      expect((jsonDecode(result.rawJson) as Map)['required_slots'],
+          isNot(contains('product_listing')));
+      expect(draftRequiresHumanReview(result), isFalse);
+    }
+  });
+
+  test('offering an approved tutorial link is not asking for a product page',
+      () {
+    final service = CodexReplyService(
+        executable: '/unused',
+        workspace: Directory('/unused'),
+        knowledgeDirectory: Directory('/unused'),
+        outputSchema: File('/unused'));
+    for (final reply in [
+      'I can share the approved tutorial link.',
+      '我可以把教程链接发给您。',
+      'Please open the following tutorial link.'
+    ]) {
+      final draft = AiDraft.fromJson({
+        'reply': '$reply\nhttps://example.test/guide.mp4',
+        'decision': 'draft',
+        'confidence': .9,
+        'used_record_ids': ['approved_tutorial'],
+        'required_slots': [],
+        'actions': [],
+        'risk_level': 'low',
+        'risk_triggers': [],
+        'human_review_required': false,
+      }, mediaBaseUrl: Uri());
+      final result =
+          service.enforceCustomerFacingPolicy(draft, 'How do I load paper?');
+      expect(result.reply, contains(reply));
+      expect(result.reply, contains('https://example.test/guide.mp4'));
+      expect(result.decision, 'draft');
     }
   });
 }

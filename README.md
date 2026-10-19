@@ -16,7 +16,7 @@ flutter run -d macos
 Run `zsh tools/build_standalone_macos.sh` on the build Mac (Flutter/Xcode and
 Homebrew FFmpeg/FFprobe are needed only for packaging). This produces
 `build/standalone-prompt-release/JD Automation Standalone.zip` and a separate
-`JD Automation Standalone.app`, version 0.1.5+6, with bundle ID
+`JD Automation Standalone.app`, version 0.1.5+14, with bundle ID
 `com.grozziie.jdAutomation.standalone`. The existing release app is not replaced.
 
 The single app contains the complete knowledge dataset (cards, Markdown,
@@ -25,12 +25,13 @@ and schemas, FFmpeg/FFprobe, their non-system libraries and third-party notices,
 and a build-time snapshot of the current `data/` directory including customer
 histories, SQLite queue state, customer media, diagnostic logs, and Codex
 sessions. Credentials and environment files remain excluded. This package
-targets Apple Silicon and macOS 15 or newer. Dataset and initial-data paths,
+targets Apple Silicon; bundled native libraries determine its macOS minimum
+(currently macOS 26.0+, recorded in the package manifest). Dataset and initial-data paths,
 byte sizes, and verified SHA-256 hashes are recorded in the
 bundled `jd_runtime/package_manifest.json`. Only Finder `.DS_Store` metadata
 is omitted; symbolic links are rejected rather than shipped as external dependencies.
 
-`zsh tools/build_review_macos.sh` produces the matching 0.1.5+6 Review app under
+`zsh tools/build_review_macos.sh` produces the matching 0.1.5+14 Review app under
 `build/review-prompt-release/Build/Products/Release/`, using the project's
 existing dataset and customer data. Both build scripts leave older copies intact.
 
@@ -104,10 +105,11 @@ Hypothetical safety questions receive the supplied conditional safety guidance;
 reported active incidents retain that guidance in the actual handoff notice.
 Supported troubleshooting may state a conditional repair boundary without
 immediately transferring the customer. Missing answers still require a fresh
-second inspection, but automatic knowledge-exhaustion handoff is restricted to
-unresolved technical problems. Sales, recommendations, specifications and other
-nontechnical questions stay in the chat with a supported answer, precise
-limitation or useful clarification. Explicit-transfer, refund and active-safety
+second inspection, but automatic technical knowledge-exhaustion handoffs are
+temporarily disabled. Technical, sales and general questions stay in the chat
+with supported information or a useful clarification. This pause is enforced
+by the final transfer gate, including older technical-transfer receipts.
+Explicit-transfer, refund and active-safety
 policies remain separate. Exact-model lifecycle list rows are supplied alongside
 specification tables; Current/Legacy/Discontinued never proves live stock.
 Stable reply rules live once in `codex_workspace/AGENTS.md`; requests add only
