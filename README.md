@@ -50,79 +50,29 @@ To inspect an installation without starting capture or opening customer data,
 run its executable with `JD_INSTALLATION_CHECK=1`; it reports the resolved
 resource/data paths and checks that the bundled media tools launch.
 
-## Local Qwen second inspection
+## Direct Codex database replies
 
-The current Review/Codex flow keeps the existing first-pass keyword/Apple
-retrieval. Only a second knowledge inspection uses
-`Qwen3-Embedding-0.6B-Q8_0`: independent semantic retrieval across all eligible
-customer-KB records, combined with lexical results by rank fusion. English and
-Chinese questions are preserved. Model/category checks still apply; developer
-notes and customer histories are not indexed.
+The desktop reply flow captures the customer's message and passes their bounded
+conversation context, private media, and shared local knowledge database paths
+to Codex. Codex reads the database files directly using its read-only tools and
+returns a structured reply citing exact record IDs or source filenames.
+The app does not run embeddings, keyword retrieval, query planning, ranking,
+file sorting, evidence selection, or an automatic second inspection in this flow.
+The full database remains on disk; its contents are not uploaded in every prompt.
+Codex must read the relevant content before answering product questions.
 
-One-time setup on the Review Mac:
+Customer sessions remain separate. Direct-database sessions use a new
+`codex_sessions_direct_database` directory so older retrieval-based threads
+are not resumed. Video observation reports are prepared before
+reply generation. Customer identity checks, structured output validation, source
+citation checks, transfer policies, durable delivery and receipt reconciliation
+remain enabled. Citation validation checks source membership; it does not prove
+that every statement is supported by the cited file. Missing information should
+produce a useful clarification rather than an invented answer.
 
-```sh
-brew install llama.cpp
-zsh tools/download_qwen_embeddings.sh
-```
-
-This downloads the official, revision-pinned 639 MB GGUF directly from Hugging
-Face and verifies its SHA-256. The app starts its own loopback-only native
-embedding process; no separate model service or Python runtime is required.
-`JD_LLAMA_SERVER` and `JD_QWEN_MODEL_PATH` can specify explicit native-runtime
-and model paths. The default weights and derived index live in
-`data/qwen_embeddings/`, outside the app bundle. For Standalone, pass its
-Application Support `data/qwen_embeddings` path to the download script.
-
-Preparation runs in the background and persists knowledge-only vectors.
-The initial full index takes longer than subsequent queries; prepare it before
-enabling production automation with this retrieval-only check:
-
-```sh
-flutter test --no-pub --dart-define=JD_QWEN_LIVE_TEST=true test/qwen_semantic_live_test.dart --reporter expanded
-```
-
-It does not open JD or send messages. A missing model, incomplete index,
-invalid embedding, or native timeout is a retriable retrieval failure, not
-permission to claim that two searches found no answer or to transfer a chat.
-The standalone packager includes the small native runtime/libraries but excludes
-downloaded weights and embedding caches from its initial-data snapshot.
-
-### Evidence selection and answer policy
-
-Queries now keep the current request and only necessary follow-up context.
-Second-pass fusion preserves a candidate's best rank with bounded agreement,
-rather than letting repeated query variants bury a strong single-engine hit.
-Before applying the evidence limit, selection deduplicates source paragraphs,
-expands operation-relevant sections of retrieved KB sources, and checks coverage
-of the requested operations. Explicit mixed-document section headings override
-incorrect inherited product-family labels; no sales-model/structure mapping is
-invented. Applicable universal safety procedures are reserved independently of
-search rank.
-
-A risk label alone is neither missing knowledge nor a transfer instruction.
-Hypothetical safety questions receive the supplied conditional safety guidance;
-reported active incidents retain that guidance in the actual handoff notice.
-Supported troubleshooting may state a conditional repair boundary without
-immediately transferring the customer. Missing answers still require a fresh
-second inspection, but automatic technical knowledge-exhaustion handoffs are
-temporarily disabled. Technical, sales and general questions stay in the chat
-with supported information or a useful clarification. This pause is enforced
-by the final transfer gate, including older technical-transfer receipts.
-Explicit-transfer, refund and active-safety
-policies remain separate. Exact-model lifecycle list rows are supplied alongside
-specification tables; Current/Legacy/Discontinued never proves live stock.
-Stable reply rules live once in `codex_workspace/AGENTS.md`; requests add only
-short turn-specific instructions. General no-answer cases ask one useful new
-clarification rather than transferring or repeating a holding promise.
-
-Generation-only quality checks use synthetic customers and temporary histories;
-they never open JD, send replies, or transfer conversations. They use the
-configured Codex account and are opt-in:
-
-```sh
-flutter test --no-pub --dart-define=JD_ANSWER_QUALITY_LIVE=true test/answer_quality_live_test.dart --reporter expanded
-```
+The old retrieval modules and optional HTTP RAG backend remain available for
+separate tests/tools; desktop reply generation does not call them. Qwen model
+setup is no longer required for desktop replies.
 
 ## RAG backend
 

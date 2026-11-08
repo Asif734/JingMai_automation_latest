@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter/services.dart';
@@ -236,6 +237,23 @@ void main() {
     }''');
     expect(draftUsesOnlyApprovedKnowledge(grounded, {'record_a'}), isTrue);
     expect(draftUsesOnlyApprovedKnowledge(grounded, {'record_b'}), isFalse);
+    final relativeFile = service.parseResponse('''{
+      "reply": "Verified video answer",
+      "decision": "draft",
+      "confidence": 0.98,
+      "used_record_ids": ["rag_cards/attendance_video_materials.json"],
+      "required_slots": [],
+      "actions": [],
+      "risk_level": "low",
+      "risk_triggers": [],
+      "auto_send_allowed": false,
+      "attachments": [],
+      "human_review_required": false
+    }''');
+    expect(
+        draftUsesOnlyApprovedKnowledge(
+            relativeFile, {'attendance_video_materials.json'}),
+        isTrue);
     final uncited = service.parseResponse('''{
       "reply": "Unsupported answer",
       "decision": "draft",
@@ -250,6 +268,33 @@ void main() {
       "human_review_required": false
     }''');
     expect(draftUsesOnlyApprovedKnowledge(uncited, {'record_a'}), isFalse);
+  });
+
+  test('direct database citation IDs include nested video content IDs',
+      () async {
+    final cards = Directory('${root.path}/knowledge/rag_cards');
+    await cards.create(recursive: true);
+    await File('${cards.path}/attendance_video_materials.json').writeAsString(
+      jsonEncode({
+        'items': [
+          {
+            'content_id': 'attendance_set_time',
+            'segments': [
+              {'segment_id': 'attendance_set_time_step_1'}
+            ]
+          }
+        ]
+      }),
+    );
+
+    final ids = await directKnowledgeRecordIds(
+      Directory('${root.path}/knowledge'),
+    );
+
+    expect(
+      ids,
+      containsAll(['attendance_set_time', 'attendance_set_time_step_1']),
+    );
   });
 
   test('records the model actually selected for a fallback reply', () {
@@ -574,6 +619,63 @@ void main() {
     expect(isVideoGuideRequest('Please send the setup video guide'), isTrue);
     expect(isVideoGuideRequest('请发设置视频教程'), isTrue);
     expect(isVideoGuideRequest('I sent a fault video'), isFalse);
+  });
+
+  test('an approved video request keeps steps and appends only the raw link',
+      () {
+    const url = 'https://video.example/M880-setup.mp4';
+    final draft = service.parseResponse('''{
+      "reply":"1. Open Settings.\\n2. Set the date and time.\\nVideo tutorial: $url",
+      "decision":"draft",
+      "confidence":0.98,
+      "used_record_ids":["attendance_set_time"],
+      "required_slots":[],
+      "actions":[],
+      "risk_level":"low",
+      "risk_triggers":[],
+      "auto_send_allowed":false,
+      "attachments":[],
+      "human_review_required":false
+    }''');
+
+    final withTutorial = enforceVideoTutorialLinkPolicy(
+      draft,
+      videoGuideRequested: true,
+      approvedVideoUrls: {url},
+    );
+
+    expect(withTutorial.reply,
+        '1. Open Settings.\n2. Set the date and time.\n$url');
+    expect(withTutorial.attachments, isEmpty);
+    expect(withTutorial.decision, 'draft');
+    expect(
+        (jsonDecode(withTutorial.rawJson)
+            as Map<String, dynamic>)['attachments'],
+        isEmpty);
+  });
+
+  test('an unapproved video URL is never promoted to a link-only reply', () {
+    final draft = service.parseResponse('''{
+      "reply":"Try https://unapproved.example/setup.mp4",
+      "decision":"draft",
+      "confidence":0.8,
+      "used_record_ids":["attendance_set_time"],
+      "required_slots":[],
+      "actions":[],
+      "risk_level":"low",
+      "risk_triggers":[],
+      "auto_send_allowed":false,
+      "attachments":[],
+      "human_review_required":false
+    }''');
+
+    final unchanged = enforceVideoTutorialLinkPolicy(
+      draft,
+      videoGuideRequested: true,
+      approvedVideoUrls: const {'https://approved.example/setup.mp4'},
+    );
+
+    expect(unchanged.reply, contains('unapproved.example'));
   });
 
   test('keeps the technical subject for a short follow-up complaint', () {

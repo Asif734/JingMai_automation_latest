@@ -18,7 +18,7 @@ from app.tickets import ConversationPausedError, TicketStore
 
 
 ROOT = Path(__file__).resolve().parents[2]
-KNOWLEDGE = ROOT / "格志中国市场客服完整知识库-2026-08-16"
+KNOWLEDGE = ROOT / "格志京东客服知识库-2026-10-04"
 
 
 class FakeEmbedder:
@@ -34,10 +34,10 @@ class FakeEmbedder:
 
 def test_loads_all_curated_cards_and_source_chunks():
     corpus = load_corpus(KNOWLEDGE)
-    assert len([row for row in corpus.records if row.record_type == "card"]) == 91
-    assert len([row for row in corpus.records if row.record_type == "source_chunk"]) == 535
+    assert len([row for row in corpus.records if row.record_type == "card"]) == 530
+    assert len([row for row in corpus.records if row.record_type == "source_chunk"]) == 832
     assert len(corpus.content_hash) == 64
-    assert len(corpus.media) == 18
+    assert len(corpus.media) == 21
 
 
 def test_risk_rules_override_generation():
@@ -119,7 +119,7 @@ def test_builds_and_reloads_faiss_index(tmp_path):
     corpus = load_corpus(KNOWLEDGE)
     index = RagIndex(tmp_path, corpus)
     count, dimensions = index.rebuild(FakeEmbedder())
-    assert count == 626
+    assert count == 1362
     assert dimensions == 16
     assert (tmp_path / "metadata.sqlite3").is_file()
     assert RagIndex(tmp_path, corpus).ready
@@ -136,7 +136,7 @@ def test_api_runs_without_openai_key(monkeypatch, tmp_path):
         assert "JD Seller RAG Tester" in tester.text
         health = client.get("/health")
         assert health.status_code == 200
-        assert health.json()["records"] == 626
+        assert health.json()["records"] == 1362
         result = client.post("/v1/retrieve", json={"query": "怎么设置日期"})
         assert result.status_code == 200
         assert result.json()["hits"]

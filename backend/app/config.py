@@ -18,7 +18,7 @@ class Settings:
     @classmethod
     def from_env(cls) -> "Settings":
         root = Path(__file__).resolve().parents[2]
-        default_knowledge = root / "格志中国市场客服完整知识库-2026-08-16"
+        default_knowledge = root / "格志京东客服知识库-2026-10-04"
         return cls(
             knowledge_dir=Path(os.getenv("KNOWLEDGE_DIR", str(default_knowledge))).resolve(),
             data_dir=Path(os.getenv("RAG_DATA_DIR", str(root / "data" / "rag"))).resolve(),

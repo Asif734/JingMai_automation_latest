@@ -81,5 +81,7 @@ tmp/
 
 # New JD knowledge package: keep text KB and RAG data available for Git,
 # but leave media assets and original uploads local.
+/格志京东客服知识库-2026-10-04.zip
 /格志京东客服知识库-2026-10-04/assets/
 /格志京东客服知识库-2026-10-04/sources/
+/格志京东客服知识库-2026-10-04/rag_index/customer_service_rag_index.json

@@ -11,7 +11,7 @@ services:
       OPENAI_EMBEDDING_MODEL: ${OPENAI_EMBEDDING_MODEL:-text-embedding-3-large}
       RAG_ADMIN_TOKEN: ${RAG_ADMIN_TOKEN:-}
     volumes:
-      - "./格志中国市场客服完整知识库-2026-08-16:/knowledge:ro"
+      - "./格志京东客服知识库-2026-10-04:/knowledge:ro"
       - rag-data:/data
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"]
